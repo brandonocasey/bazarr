@@ -72,6 +72,13 @@ export const Subtitle: FunctionComponent<Props> = ({
         onClose: () => setOpen(false),
       }}
       selections={selections}
+      cleanupMedia={[
+        {
+          media_type: "series",
+          media_id: episodeId,
+          title: mediaTitle ?? `Episode ${episodeId}`,
+        },
+      ]}
       onAction={async (action) => {
         if (action === "search") {
           await download.mutateAsync({
