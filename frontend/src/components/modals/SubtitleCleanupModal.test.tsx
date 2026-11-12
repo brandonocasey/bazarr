@@ -1,3 +1,4 @@
+import { act } from "react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw/http";
 import { describe, expect, it, vi } from "vitest";
@@ -755,4 +756,253 @@ describe("Subtitle cleanup", () => {
       }),
     ).toBeDisabled();
   });
+  it("clears confirmation during refresh, after failure and after retrying identical ready data", async () => {
+    register();
+    customRender(<SubtitleCleanupView media={[movie]} />);
+    const user = await previewAndChoose();
+    const confirmation = screen.getByRole("checkbox", {
+      name: /I reviewed every selected preview/,
+    });
+    await user.click(confirmation);
+    const pending = {
+      finish: (): void => undefined,
+      refresh: Promise.resolve(),
+    };
+    const response = new Promise<void>((resolve) => {
+      pending.finish = resolve;
+    });
+    server.use(
+      http.get("/api/subtitles/cleanup/:id", async () => {
+        await response;
+        return HttpResponse.json(
+          { error: "Preview could not be revalidated" },
+          { status: 503 },
+        );
+      }),
+    );
+    await act(async () => {
+      pending.refresh = queryClient.invalidateQueries({
+        queryKey: [
+          QueryKeys.Subtitles,
+          "cleanup",
+          "movie:7",
+          "movie-operation",
+        ],
+      });
+    });
+    await waitFor(() => expect(confirmation).not.toBeChecked());
+    expect.soft(confirmation).toBeDisabled();
+    expect
+      .soft(screen.getByRole("button", { name: "Apply confirmed cleanup" }))
+      .toBeDisabled();
+    await act(async () => {
+      pending.finish();
+      await pending.refresh;
+    });
+    await screen.findAllByText(/Preview could not be revalidated/);
+    expect.soft(confirmation).not.toBeChecked();
+    server.use(
+      http.get("/api/subtitles/cleanup/:id", () =>
+        HttpResponse.json(operation()),
+      ),
+    );
+    await user.click(screen.getByRole("button", { name: "Retry operation" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Operation could not be refreshed"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(confirmation).not.toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "Apply confirmed cleanup" }),
+    ).toBeDisabled();
+    await user.click(confirmation);
+    expect(
+      screen.getByRole("button", { name: "Apply confirmed cleanup" }),
+    ).toBeEnabled();
+  });
+
+  it.each([2, 20])(
+    "refreshes only the matching history for each staggered terminal result in a %i-movie batch",
+    async (count) => {
+      const media: CleanupMedia[] = Array.from(
+        { length: count },
+        (_, index) => ({
+          ...movie,
+          media_id: 7 + index,
+          title: `Batch ${index}`,
+        }),
+      );
+      media.push(episode);
+      const calls = new Map<string, number>();
+      const completed = new Set<string>();
+      const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+      const keyOf = (item: CleanupMedia) =>
+        `${item.media_type}:${item.media_id}`;
+      const resultFor = (item: CleanupMedia): CleanupOperation => ({
+        ...operation(item),
+        id: keyOf(item),
+        status: completed.has(keyOf(item)) ? "complete" : "ready",
+      });
+      server.use(
+        http.get("/api/subtitles/cleanup", ({ request }) => {
+          const url = new URL(request.url);
+          const key = `${url.searchParams.get("media_type")}:${url.searchParams.get("media_id")}`;
+          calls.set(key, (calls.get(key) ?? 0) + 1);
+          return HttpResponse.json({ data: [] });
+        }),
+        http.post("/api/subtitles/cleanup/preview", async ({ request }) => {
+          const body = (await request.json()) as CleanupMedia;
+          return HttpResponse.json(resultFor(body), { status: 202 });
+        }),
+        http.get("/api/subtitles/cleanup/:id", ({ params }) => {
+          const item = media.find((item) => keyOf(item) === params.id);
+          if (!item) throw new Error("Unknown fixture media");
+          return HttpResponse.json(resultFor(item));
+        }),
+      );
+      customRender(<SubtitleCleanupView media={media} />);
+      await userEvent.click(
+        screen.getByRole("button", { name: "Preview selected media" }),
+      );
+      await screen.findByText("Operation series:7: ready");
+      await waitFor(() =>
+        expect([...calls.values()]).toEqual(media.map(() => 2)),
+      );
+      for (const item of media) {
+        const key = keyOf(item);
+        completed.add(key);
+        await act(async () => {
+          await queryClient.invalidateQueries({
+            queryKey: [QueryKeys.Subtitles, "cleanup", key, key],
+          });
+        });
+        await screen.findByText(`Operation ${key}: complete`);
+        await waitFor(() => expect(calls.get(key)).toBe(3));
+        expect(Object.fromEntries(calls)).toEqual(
+          Object.fromEntries(
+            media.map((other) => [
+              keyOf(other),
+              completed.has(keyOf(other)) ? 3 : 2,
+            ]),
+          ),
+        );
+      }
+      expect(
+        [...calls.values()].reduce((total, value) => total + value, 0),
+      ).toBe(media.length * 3);
+      for (const inventory of [
+        QueryKeys.Movies,
+        QueryKeys.Episodes,
+        QueryKeys.Series,
+        QueryKeys.History,
+      ]) {
+        expect(invalidate).toHaveBeenCalledWith({ queryKey: [inventory] });
+      }
+    },
+    30000,
+  );
+
+  it("shows every restored original track, including the lower score listed first, without proposed removals", async () => {
+    const restored = operation();
+    if (!restored.analysis) throw new Error("Fixture analysis missing");
+    const [first, second] = restored.analysis.tracks;
+    restored.analysis.tracks = [
+      { ...first, key: "A", score: 0.2 },
+      { ...second, key: "B", score: 0.9 },
+    ];
+    restored.groups = [
+      {
+        ...restored.groups[0],
+        track_keys: ["A", "B"],
+        recommended_keeper: "B",
+      },
+    ];
+    restored.status = "restored";
+    restored.result = {
+      retained_track_keys: ["A", "B"],
+      removed_track_keys: [],
+      changed_files: [],
+      restored_files: [first.path, second.path],
+    };
+    register(restored);
+    server.use(
+      http.get("/api/subtitles/cleanup", () =>
+        HttpResponse.json({ data: [restored] }),
+      ),
+    );
+    customRender(<SubtitleCleanupView media={[movie]} />);
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("combobox", {
+        name: `Previous cleanup for ${movie.title}`,
+      }),
+    );
+    await user.click(
+      await screen.findByRole("option", {
+        hidden: true,
+        name: /movie-operation/,
+      }),
+    );
+    await screen.findByText(/Operation movie-operation: restored/);
+    expect(screen.getAllByText(/^KEEP: timing correlation/)).toHaveLength(2);
+    expect(
+      screen.queryByText("Previewed physical changes for these keeper choices"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/^REMOVE: timing correlation/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Rewrite without re-encoding:/),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Remove subtitle file:/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Lost caption variants:.*HI/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Retained tracks: A, B")).toBeInTheDocument();
+  });
+  it.each([null, "/backups/preview-operation"])(
+    "displays nullable audio and backup location %s accurately",
+    async (backupPath) => {
+      const preview = operation();
+      if (!preview.analysis) throw new Error("Fixture analysis missing");
+      preview.analysis.audio_stream_index = null;
+      preview.analysis.audio_streams = [];
+      preview.analysis.tracks = preview.analysis.tracks.map((track) => ({
+        ...track,
+        score: null,
+        error: "no audio reference",
+      }));
+      preview.groups = preview.groups.map((group) => ({
+        ...group,
+        requires_selection: group.track_keys.length > 1,
+        recommended_keeper:
+          group.track_keys.length === 1 ? group.track_keys[0] : null,
+      }));
+      preview.backup_path = backupPath;
+      register(preview);
+      customRender(<SubtitleCleanupView media={[movie]} />);
+      const user = await previewAndChoose();
+      await user.click(
+        screen.getByRole("radio", { name: /Keep eng; full dialogue; regular/ }),
+      );
+      expect(
+        screen.getByText("No audio reference available."),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText(/Analyzed against stream null/),
+      ).not.toBeInTheDocument();
+      expect(screen.getByText(/Backup location:/)).toHaveTextContent(
+        backupPath ?? "not available for this operation",
+      );
+      await user.click(
+        screen.getByRole("checkbox", {
+          name: /I reviewed every selected preview/,
+        }),
+      );
+      expect(
+        screen.getByRole("button", { name: "Apply confirmed cleanup" }),
+      ).toBeEnabled();
+    },
+  );
 });

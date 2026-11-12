@@ -45,7 +45,7 @@ export interface CleanupOperation extends CleanupMedia {
   analysis: {
     video_path: string;
     duration: number;
-    audio_stream_index: number;
+    audio_stream_index: number | null;
     audio_streams: {
       index: number;
       language: string | null;

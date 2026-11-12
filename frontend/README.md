@@ -103,20 +103,29 @@ This command will be automatically triggered before any commits to git. Run manu
 
 ## Subtitle cleanup
 
-Use **Cleanup subtitles** on a series episode page or **Cleanup redundant subtitles...**
-on a movie's More Actions or subtitle menu. The movie list also offers cleanup in
-Select mode. The shared dialog lets you select media, create independent previews,
-choose the audio reference, review keepers and removals, and confirm all selected
-previews before files change. Embedded tracks and external format companions are
-included. Jobs continue after the dialog closes; select a previous cleanup to
-inspect results or restore its verified backup.
+Use **Cleanup subtitles** on a series episode page.
+On movies, choose **Cleanup redundant subtitles...** from More Actions or the subtitle menu.
+Movie Select mode also offers cleanup.
 
-Cleanup uses a new speech-timing Pearson correlation (-1 to 1). Historical download
-match percentages are shown separately. Within each language and forced-caption
-group, normal and hearing-impaired tracks compete. Fully rankable groups allow
-only a highest-scoring keeper; tied maxima and groups with unrankable tracks need
-an explicit choice. Timing cannot establish translation quality, completeness,
-language correctness or actual redundancy. Review lost caption variants, physical
-rewrites/deletions, backup location and required free space before confirming.
-Changing the audio reference requires another preview. Stale previews and changed
-files are refused by the server; restore refuses to overwrite later edits.
+Select media and create independent previews before confirming any writes.
+Choose the audio reference and review every keeper, removal, caption loss and physical change.
+Embedded tracks and external format companions are included.
+Jobs continue after the dialog closes.
+
+Select a previous cleanup to inspect results or restore its verified backup.
+Preview details show the backup location when available.
+A missing location is labeled unavailable.
+Review required free space before confirming.
+
+Cleanup uses a new speech-timing Pearson correlation (-1 to 1).
+Historical download match percentages are shown separately.
+Within each language and forced-caption group, normal and hearing-impaired tracks compete.
+Fully rankable groups allow only a highest-scoring keeper.
+
+Tied maxima and groups containing unrankable tracks require an explicit choice.
+Timing cannot establish translation quality, completeness, language correctness or actual redundancy.
+Changing the audio reference requires another preview.
+Refreshing an operation clears confirmation, including when the same preview returns.
+
+The server refuses stale previews and changed files.
+Restore refuses to overwrite later edits.

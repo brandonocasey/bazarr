@@ -19,6 +19,7 @@ import {
   useCleanupOperations,
 } from "@/apis/hooks/cleanup";
 import {
+  CleanupGroup,
   CleanupMedia,
   cleanupMediaKey,
   CleanupOperation,
@@ -34,20 +35,57 @@ const trackDescription = (track: CleanupTrack) =>
 
 const bytes = (value: number) => `${value.toLocaleString()} bytes`;
 
+const defaultKeeper = (group: CleanupGroup) => {
+  if (group.requires_selection) return "";
+  if (group.recommended_keeper) return group.recommended_keeper;
+  if (group.track_keys.length === 1) return group.track_keys[0];
+  return "";
+};
+
+const trackDisposition = (
+  key: string,
+  retained: Set<string>,
+  resolved: Set<string>,
+) => {
+  if (retained.has(key)) return "KEEP";
+  if (resolved.has(key)) return "REMOVE";
+  return "Awaiting keeper";
+};
+
+const physicalAction = (
+  tracks: CleanupTrack[],
+  retained: Set<string>,
+  resolved: Set<string>,
+) => {
+  if (tracks.some((track) => !resolved.has(track.key)))
+    return "Awaiting keeper selection";
+  if (
+    tracks.some(
+      (track) => track.source === "embedded" || retained.has(track.key),
+    )
+  )
+    return "Rewrite without re-encoding";
+  return "Remove subtitle file";
+};
+
+const recordedDisposition = (
+  key: string,
+  retained: Set<string>,
+  removed: Set<string>,
+) => {
+  if (retained.has(key)) return "Recorded retained track";
+  if (removed.has(key)) return "Recorded removed track";
+  return "Analyzed track";
+};
+
 const keeperChoices = (
   operation: CleanupOperation,
   choices: Record<string, string> = {},
 ) => {
-  const retained = new Set(operation.result?.retained_track_keys);
   return Object.fromEntries(
     operation.groups.map((group) => [
       group.key,
-      group.track_keys.find((key) => retained.has(key)) ??
-        choices[group.key] ??
-        (!group.requires_selection
-          ? (group.recommended_keeper ??
-            (group.track_keys.length === 1 ? group.track_keys[0] : ""))
-          : ""),
+      choices[group.key] ?? defaultKeeper(group),
     ]),
   );
 };
@@ -69,6 +107,13 @@ const eligibleKeepers = (keys: string[], tracks: Map<string, CleanupTrack>) => {
   );
 };
 
+const groupDescription = (group: CleanupGroup, operation: CleanupOperation) => {
+  if (operation.result) return "Recorded track results.";
+  if (group.requires_selection)
+    return "Tied or unrankable: explicitly choose one keeper.";
+  return "Keep the highest timing score. Lower scores cannot be selected. Normal and HI tracks compete.";
+};
+
 const OperationPreview = ({
   operation,
   keepers,
@@ -83,11 +128,18 @@ const OperationPreview = ({
   const tracks = new Map(
     operation.analysis?.tracks.map((track) => [track.key, track]),
   );
-  const retained = new Set(Object.values(keepers));
+  const retained = new Set(
+    operation.result?.retained_track_keys ?? Object.values(keepers),
+  );
   const resolved = new Set(
-    operation.groups
-      .filter((group) => keepers[group.key])
-      .flatMap((group) => group.track_keys),
+    operation.result
+      ? [
+          ...operation.result.retained_track_keys,
+          ...operation.result.removed_track_keys,
+        ]
+      : operation.groups
+          .filter((group) => keepers[group.key])
+          .flatMap((group) => group.track_keys),
   );
   const units = new Map<string, { paths: string[]; tracks: CleanupTrack[] }>();
   operation.analysis?.tracks.forEach((track) => {
@@ -111,11 +163,7 @@ const OperationPreview = ({
           <Paper withBorder p="sm" key={group.key}>
             <Radio.Group
               label={`${group.language ?? "Unknown language"} — ${group.forced ? "forced" : "full dialogue"}`}
-              description={
-                group.requires_selection
-                  ? "Tied or unrankable: explicitly choose one keeper."
-                  : "Keep the highest timing score. Lower scores cannot be selected. Normal and HI tracks compete."
-              }
+              description={groupDescription(group, operation)}
               value={keepers[group.key] ?? ""}
               onChange={(track) => onKeeper(group.key, track)}
             >
@@ -124,19 +172,19 @@ const OperationPreview = ({
                   const track = tracks.get(key);
                   return (
                     <Stack key={key} gap={2}>
-                      <Radio
-                        disabled={disabled || !track || !eligible.has(key)}
-                        value={key}
-                        label={`Keep ${track ? trackDescription(track) : `Unavailable track ${key}`}`}
-                      />
+                      {operation.result && track ? (
+                        <Text>{trackDescription(track)}</Text>
+                      ) : (
+                        <Radio
+                          disabled={disabled || !track || !eligible.has(key)}
+                          value={key}
+                          label={`Keep ${track ? trackDescription(track) : `Unavailable track ${key}`}`}
+                        />
+                      )}
                       {track && (
                         <Text size="sm" style={{ overflowWrap: "anywhere" }}>
-                          {keepers[group.key] === key
-                            ? "KEEP"
-                            : keepers[group.key]
-                              ? "REMOVE"
-                              : "Awaiting keeper"}
-                          : timing correlation{" "}
+                          {trackDisposition(key, retained, resolved)}: timing
+                          correlation{" "}
                           {track.score === null
                             ? `unrankable (${track.error ?? "no usable signal"})`
                             : String(track.score)}
@@ -149,7 +197,7 @@ const OperationPreview = ({
                 })}
               </Stack>
             </Radio.Group>
-            {keepers[group.key] && (
+            {!operation.result && keepers[group.key] && (
               <Text size="sm" mt="xs">
                 Lost caption variants:{" "}
                 {group.track_keys
@@ -167,32 +215,30 @@ const OperationPreview = ({
       {!operation.groups.length && (
         <Text>No subtitle tracks found. There is nothing to remove.</Text>
       )}
-      <Text fw={600}>Previewed physical changes for these keeper choices</Text>
-      {!changes.length && (
-        <Text>No files need changing for the resolved groups.</Text>
-      )}
-      {changes.flatMap((unit) => {
-        const action = unit.tracks.some((track) => !resolved.has(track.key))
-          ? "Awaiting keeper selection"
-          : unit.tracks.some(
-                (track) =>
-                  track.source === "embedded" || retained.has(track.key),
-              )
-            ? "Rewrite without re-encoding"
-            : "Remove subtitle file";
-        return unit.paths.map((path) => (
-          <Text key={path} size="sm" style={{ overflowWrap: "anywhere" }}>
-            {action}: {path}
+      {!operation.result && (
+        <>
+          <Text fw={600}>
+            Previewed physical changes for these keeper choices
           </Text>
-        ));
-      })}
+          {!changes.length && (
+            <Text>No files need changing for the resolved groups.</Text>
+          )}
+          {changes.flatMap((unit) =>
+            unit.paths.map((path) => (
+              <Text key={path} size="sm" style={{ overflowWrap: "anywhere" }}>
+                {physicalAction(unit.tracks, retained, resolved)}: {path}
+              </Text>
+            )),
+          )}
+        </>
+      )}
       <Text>
         Required free space: {bytes(operation.required_space_bytes)}{" "}
         (conservative backup plus replacement estimate).
       </Text>
       <Text>
         Independent verified backups are created before replacement. Backup
-        location: {operation.backup_path ?? "assigned when cleanup is applied"}.
+        location: {operation.backup_path ?? "not available for this operation"}.
       </Text>
       <details>
         <summary>
@@ -235,7 +281,7 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
   const [running, setRunning] = useState(false);
   const inFlight = useRef(false);
   const histories = useCleanupHistories(media);
-  const queries = useCleanupOperations(media, ids);
+  const queries = useCleanupOperations(media, ids, () => setConfirmed(null));
   const actions = useCleanupActions();
   const selectedMedia = media.filter((item) =>
     selected.has(cleanupMediaKey(item)),
@@ -272,6 +318,7 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
       if (
         !operation ||
         query.isError ||
+        query.isFetching ||
         operation.status !== "ready" ||
         errors[cleanupMediaKey(operation)] ||
         !operation.analysis ||
@@ -302,59 +349,72 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
       );
     });
 
-  const perform = async (action: "preview" | "apply") => {
-    if (
-      inFlight.current ||
-      (action === "apply" && (!canApply || confirmed !== snapshot))
-    )
-      return;
+  const clearPreview = (key: string) => {
+    setIds((previous) => {
+      const next = { ...previous };
+      delete next[key];
+      return next;
+    });
+  };
+
+  const requestForMedia = async (
+    item: CleanupMedia,
+    request: () => Promise<CleanupOperation>,
+    onError?: () => void,
+  ) => {
+    const key = cleanupMediaKey(item);
+    try {
+      const result = await request();
+      if (cleanupMediaKey(result) !== key)
+        throw new Error(
+          "Server returned cleanup for different media. Create a new preview.",
+        );
+      setIds((previous) => ({ ...previous, [key]: result.id }));
+      setErrors((previous) => ({ ...previous, [key]: "" }));
+    } catch (error) {
+      setErrors((previous) => ({
+        ...previous,
+        [key]: error instanceof Error ? error.message : String(error),
+      }));
+      onError?.();
+    }
+  };
+
+  const runBatch = async (request: (item: CleanupMedia) => Promise<void>) => {
+    if (inFlight.current) return;
     inFlight.current = true;
     setRunning(true);
     setConfirmed(null);
     try {
-      for (const item of selectedMedia) {
-        const key = cleanupMediaKey(item);
-        try {
-          const operation = queries[indexes.get(key) ?? -1]?.data;
-          const result =
-            action === "preview"
-              ? await actions.preview.mutateAsync({
-                  media: item,
-                  audio: audio[key],
-                })
-              : operation &&
-                (await actions.apply.mutateAsync({
-                  operation,
-                  keepers: keeperChoices(
-                    operation,
-                    choices[previewKey(operation)],
-                  ),
-                }));
-          if (result) {
-            if (cleanupMediaKey(result) !== key)
-              throw new Error(
-                "Server returned cleanup for different media. Create a new preview.",
-              );
-            setIds((previous) => ({ ...previous, [key]: result.id }));
-            setErrors((previous) => ({ ...previous, [key]: "" }));
-          }
-        } catch (error) {
-          setErrors((previous) => ({
-            ...previous,
-            [key]: error instanceof Error ? error.message : String(error),
-          }));
-          if (action === "preview")
-            setIds((previous) => {
-              const next = { ...previous };
-              delete next[key];
-              return next;
-            });
-        }
-      }
+      for (const item of selectedMedia) await request(item);
     } finally {
       inFlight.current = false;
       setRunning(false);
     }
+  };
+
+  const previewSelected = () =>
+    runBatch((item) => {
+      const key = cleanupMediaKey(item);
+      return requestForMedia(
+        item,
+        () => actions.preview.mutateAsync({ media: item, audio: audio[key] }),
+        () => clearPreview(key),
+      );
+    });
+
+  const applySelected = async () => {
+    if (!canApply || confirmed !== snapshot) return;
+    await runBatch(async (item) => {
+      const operation = queries[indexes.get(cleanupMediaKey(item)) ?? -1]?.data;
+      if (!operation) return;
+      await requestForMedia(item, () =>
+        actions.apply.mutateAsync({
+          operation,
+          keepers: keeperChoices(operation, choices[previewKey(operation)]),
+        }),
+      );
+    });
   };
 
   const restore = async (operation: CleanupOperation) => {
@@ -500,11 +560,18 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
                     <>
                       <Select
                         label={`Audio reference for ${item.title}`}
-                        description={`Analyzed against stream ${operation.analysis.audio_stream_index}. Changing the reference requires a new preview.`}
+                        description={
+                          operation.analysis.audio_stream_index === null
+                            ? "No audio reference available."
+                            : `Analyzed against stream ${operation.analysis.audio_stream_index}. Changing the reference requires a new preview.`
+                        }
                         disabled={busy}
-                        value={String(
-                          audio[key] ?? operation.analysis.audio_stream_index,
-                        )}
+                        value={
+                          audio[key] !== undefined
+                            ? String(audio[key])
+                            : (operation.analysis.audio_stream_index?.toString() ??
+                              null)
+                        }
                         data={operation.analysis.audio_streams.map(
                           (stream) => ({
                             value: String(stream.index),
@@ -567,11 +634,11 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
                           size="sm"
                           style={{ overflowWrap: "anywhere" }}
                         >
-                          {retainedResults.has(track.key)
-                            ? "Recorded retained track"
-                            : removedResults.has(track.key)
-                              ? "Recorded removed track"
-                              : "Analyzed track"}
+                          {recordedDisposition(
+                            track.key,
+                            retainedResults,
+                            removedResults,
+                          )}
                           : {trackDescription(track)}
                         </Text>
                       ))}
@@ -627,7 +694,7 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
         <Button
           disabled={busy || selectedMedia.length === 0}
           loading={running}
-          onClick={() => void perform("preview")}
+          onClick={() => void previewSelected()}
         >
           Preview selected media
         </Button>
@@ -644,7 +711,7 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
       <Button
         color="red"
         disabled={busy || !canApply || confirmed !== snapshot}
-        onClick={() => void perform("apply")}
+        onClick={() => void applySelected()}
       >
         Apply confirmed cleanup
       </Button>

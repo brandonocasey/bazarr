@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
 import { QueryKeys } from "@/apis/queries/keys";
 import cleanup, {
@@ -27,12 +27,14 @@ export const useCleanupHistories = (media: CleanupMedia[]) =>
 export const useCleanupOperations = (
   media: CleanupMedia[],
   ids: Record<string, string>,
+  onRefresh: () => void,
 ) => {
   const client = useQueryClient();
   const queries = useQueries({
     queries: media.map((item) => ({
       queryKey: operationKey(item, ids[cleanupMediaKey(item)] ?? ""),
       queryFn: async () => {
+        onRefresh();
         const operation = await cleanup.get(ids[cleanupMediaKey(item)]);
         if (cleanupMediaKey(operation) !== cleanupMediaKey(item)) {
           throw new Error(
@@ -53,31 +55,43 @@ export const useCleanupOperations = (
           : false,
     })),
   });
-  const finished = queries
-    .map((query) => query.data)
-    .filter(
-      (operation): operation is CleanupOperation =>
-        operation !== undefined &&
-        ["complete", "restored", "failed"].includes(operation.status),
-    )
-    .map(
-      (operation) =>
-        `${cleanupMediaKey(operation)}:${operation.id}:${operation.status}`,
-    )
-    .join(",");
-
+  const finished = useRef(new Set<string>());
   useEffect(() => {
-    if (finished) {
-      void client.invalidateQueries({ queryKey: [QueryKeys.Movies] });
-      void client.invalidateQueries({ queryKey: [QueryKeys.Episodes] });
-      void client.invalidateQueries({ queryKey: [QueryKeys.Series] });
-      void client.invalidateQueries({ queryKey: [QueryKeys.History] });
+    const current = new Set<string>();
+    const changed: CleanupOperation[] = [];
+    for (const query of queries) {
+      const operation = query.data;
+      if (
+        !operation ||
+        !["complete", "restored", "failed"].includes(operation.status)
+      )
+        continue;
+      const key = JSON.stringify([
+        cleanupMediaKey(operation),
+        operation.id,
+        operation.status,
+      ]);
+      current.add(key);
+      if (!finished.current.has(key)) changed.push(operation);
+    }
+    finished.current = current;
+    if (!changed.length) return;
+    void client.invalidateQueries({ queryKey: [QueryKeys.Movies] });
+    void client.invalidateQueries({ queryKey: [QueryKeys.Episodes] });
+    void client.invalidateQueries({ queryKey: [QueryKeys.Series] });
+    void client.invalidateQueries({ queryKey: [QueryKeys.History] });
+    for (const operation of changed) {
       void client.invalidateQueries({
-        queryKey: [QueryKeys.Subtitles, "cleanup"],
-        predicate: (query) => query.queryKey.at(-1) === "history",
+        queryKey: [
+          QueryKeys.Subtitles,
+          "cleanup",
+          cleanupMediaKey(operation),
+          "history",
+        ],
+        exact: true,
       });
     }
-  }, [client, finished]);
+  }, [client, queries]);
   return queries;
 };
 
