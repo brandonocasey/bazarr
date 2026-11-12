@@ -360,11 +360,24 @@ def _discard_backup(entry: JournalEntry) -> None:
         logging.exception('Cannot discard rolled-back cleanup backup %s', backup)
 
 
+def _captured_backup_exists(entry: JournalEntry) -> bool:
+    owner = entry.get('backup_owner')
+    if owner is None:
+        return False
+    try:
+        info = Path(entry['backup']).lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == (owner['device'], owner['inode'])
+
+
 def discard_rollback_backups(directory: Path) -> None:
     """Remove captured backup copies only after durable rollback and verification of all originals."""
     try:
         journal = read_journal(directory)
         if journal is None or journal['phase'] != 'rolled_back':
+            return
+        if not any(_captured_backup_exists(entry) for entry in journal['entries']):
             return
         if not _originals_match(journal):
             return

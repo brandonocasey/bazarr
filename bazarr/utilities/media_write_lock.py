@@ -120,7 +120,7 @@ def _try_file_lock(file: BinaryIO) -> None:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
-def _lock_file(file: BinaryIO, job_id: int | None) -> None:
+def _lock_file(file: BinaryIO, job_id: int | None, *, blocking: bool = True) -> None:
     while True:
         _raise_if_canceled(job_id)
         try:
@@ -129,12 +129,17 @@ def _lock_file(file: BinaryIO, job_id: int | None) -> None:
         except OSError as error:
             if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
                 raise
+            if not blocking:
+                raise BlockingIOError('Cannot acquire lock: active media writer') from error
         time.sleep(0.05)
 
 
 @contextmanager
-def _thread_lock(lock: _MediaLock, job_id: int | None) -> Iterator[None]:
-    while not lock.mutex.acquire(timeout=0.05):
+def _thread_lock(lock: _MediaLock, job_id: int | None, *, blocking: bool = True) -> Iterator[None]:
+    _raise_if_canceled(job_id)
+    if not blocking and not lock.mutex.acquire(blocking=False):
+        raise BlockingIOError('Cannot acquire lock: active media writer')
+    while blocking and not lock.mutex.acquire(timeout=0.05):
         _raise_if_canceled(job_id)
     try:
         _raise_if_canceled(job_id)
@@ -143,8 +148,9 @@ def _thread_lock(lock: _MediaLock, job_id: int | None) -> Iterator[None]:
         lock.mutex.release()
 
 @contextmanager
-def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[MediaWriteState]:
-    """Serialize writers and expose state changes before their bodies run."""
+def media_write_lock(video_path: str, job_id: int | None = None, *,
+                     blocking: bool = True) -> Iterator[MediaWriteState]:
+    """Serialize writers; nonblocking acquisition refuses live owners before changing state."""
     canonical = _canonical_path(video_path)
     with _registry_mutex:
         lock = _locks.get(canonical)
@@ -152,7 +158,7 @@ def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[
             lock = _MediaLock()
             _locks[canonical] = lock
 
-    with _thread_lock(lock, job_id):
+    with _thread_lock(lock, job_id, blocking=blocking):
         if lock.depth:
             lock.depth += 1
             try:
@@ -166,7 +172,7 @@ def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[
         # Retain lock files; unlinking them splits waiting and new writers across inodes.
         descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o600)
         with os.fdopen(descriptor, 'r+b') as file:
-            _lock_file(file, job_id)
+            _lock_file(file, job_id, blocking=blocking)
             previous = _read_write_state(file)
             current = _record_write_state(file, active=True)
             lock.file = file

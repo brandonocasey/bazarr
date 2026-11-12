@@ -455,8 +455,8 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
         content redundancy. Each language keeps one track; forced translations
         stay separate. Normal and hearing-impaired (HI) tracks compete, so HI
         captions can be lost. Missing timing scores require a keeper choice.
-        Unknown language tags form und groups and compete by timing score within
-        each group.
+        Tracks tagged und (undetermined language) compete by timing score within
+        their groups.
       </Alert>
       <Text>
         Previewing only analyzes files. Cleanup removes external files and

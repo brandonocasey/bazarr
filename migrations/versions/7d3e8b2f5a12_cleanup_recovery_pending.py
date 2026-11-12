@@ -14,4 +14,8 @@ def upgrade():
     if any(column['name'] == 'recovery_pending' for column in columns):
         return
     op.add_column('table_subtitle_cleanup_operations', sa.Column(
-        'recovery_pending', sa.Boolean(), nullable=False, server_default=sa.true()))
+        'recovery_pending', sa.Boolean(), nullable=False, server_default=sa.false()))
+    operations = sa.table('table_subtitle_cleanup_operations',
+                          sa.column('status', sa.Text()), sa.column('recovery_pending', sa.Boolean()))
+    op.execute(operations.update().values(
+        recovery_pending=operations.c.status.in_(('applying', 'restoring', 'failed'))))

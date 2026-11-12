@@ -397,3 +397,38 @@ def test_replacement_metadata_refusal_names_original(tmp_path, monkeypatch):
     assert str(video) in str(error.value)
     assert 'required uid' in str(error.value)
     assert video.read_bytes() == b'original video and both subtitle streams'
+
+
+@pytest.mark.parametrize('backup_state', ['absent', 'historical', 'foreign'])
+def test_settled_rollback_with_no_captured_copies_does_not_rehash_originals(tmp_path, monkeypatch, backup_state):
+    _, _, _, identities, changes = _inputs(tmp_path)
+    directory = tmp_path / 'backup'
+
+    def refuse():
+        raise ValueError('validation refused before replacement')
+
+    with pytest.raises(ValueError, match='validation refused before replacement'):
+        transactions.commit_changes(directory, changes, identities, refuse)
+    journal = transactions.read_journal(directory)
+    assert journal['phase'] == 'rolled_back'
+    for entry in journal['entries']:
+        backup = Path(entry['backup'])
+        assert not backup.exists()
+        if backup_state != 'absent':
+            backup.write_bytes(b'foreign content')
+        if backup_state == 'historical':
+            entry.pop('backup_owner')
+    (directory / 'journal.json').write_text(json.dumps(journal))
+    reads = []
+    fingerprint = transactions.fingerprint
+
+    def record_read(path):
+        reads.append(path)
+        return fingerprint(path)
+
+    monkeypatch.setattr(transactions, 'fingerprint', record_read)
+    for _ in range(2):
+        assert transactions.recover_transaction(directory)['phase'] == 'rolled_back'
+    assert reads == []
+    if backup_state != 'absent':
+        assert all(Path(entry['backup']).read_bytes() == b'foreign content' for entry in journal['entries'])

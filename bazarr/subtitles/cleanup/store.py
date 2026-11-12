@@ -2,9 +2,12 @@
 
 import json
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from sqlalchemy.sql.dml import Update
 
 from .records import IndexedSubtitle, MediaMetadata, Operation
 
@@ -21,6 +24,19 @@ class CleanupError(ValueError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+@dataclass(frozen=True)
+class OperationSnapshot:
+    id: str
+    payload: str
+    job_id: int | None
+    recovery_pending: bool
+
+    def operation(self) -> Operation:
+        operation = json.loads(self.payload)
+        operation['job_id'] = self.job_id
+        return operation
 
 
 def _canonical_source(path: str) -> str:
@@ -194,13 +210,16 @@ def create_operation(media_type: str, media_id: int, audio_stream_index: int | N
 
 
 def get_operation(operation_id: str) -> Operation:
-    row = database.execute(select(TableSubtitleCleanupOperations.payload, TableSubtitleCleanupOperations.job_id)
+    return get_operation_snapshot(operation_id).operation()
+
+
+def get_operation_snapshot(operation_id: str) -> OperationSnapshot:
+    row = database.execute(select(TableSubtitleCleanupOperations.id, TableSubtitleCleanupOperations.payload,
+                                  TableSubtitleCleanupOperations.job_id, TableSubtitleCleanupOperations.recovery_pending)
                            .where(TableSubtitleCleanupOperations.id == operation_id)).first()
     if row is None:
         raise CleanupError('Cleanup operation not found', 404)
-    payload = json.loads(row.payload)
-    payload['job_id'] = row.job_id
-    return payload
+    return OperationSnapshot(row.id, row.payload, row.job_id, row.recovery_pending)
 
 
 def get_operations(operation_ids: list[str]) -> dict[str, Operation | CleanupError]:
@@ -236,29 +255,56 @@ def list_operations(media_type: str, media_id: int) -> list[Operation]:
 
 def update_operation(operation: Operation, previous: tuple[str, ...] | None = None, *, reset_job: bool = False,
                      recovery_pending: bool | None = None) -> Operation:
-    statement = update(TableSubtitleCleanupOperations).where(TableSubtitleCleanupOperations.id == operation['id'])
+    if reset_job:
+        operation['job_id'] = None
+    statement = _operation_update(operation, recovery_pending)
     if previous is not None:
         statement = statement.where(TableSubtitleCleanupOperations.status.in_(previous))
     if reset_job:
-        operation['job_id'] = None
         statement = statement.values(job_id=None)
-    if recovery_pending is not None:
-        statement = statement.values(recovery_pending=recovery_pending)
-    result = database.execute(statement.values(status=operation['status'], payload=json.dumps(operation, allow_nan=False))
-                              .returning(TableSubtitleCleanupOperations.id)).scalar_one_or_none()
-    if result != operation['id']:
-        database.rollback()
+    if not _commit_operation(statement, operation['id']):
         raise CleanupError('Cleanup operation changed; reload its current state', 409)
-    database.commit()
     return operation
 
 
+def _operation_update(operation: Operation, recovery_pending: bool | None) -> Update:
+    statement = update(TableSubtitleCleanupOperations).where(TableSubtitleCleanupOperations.id == operation['id'])
+    if recovery_pending is not None:
+        statement = statement.values(recovery_pending=recovery_pending)
+    return statement.values(status=operation['status'], payload=json.dumps(operation, allow_nan=False))
+
+
+def _commit_operation(statement: Update, operation_id: str) -> bool:
+    result = database.execute(statement.returning(TableSubtitleCleanupOperations.id)).scalar_one_or_none()
+    if result != operation_id:
+        database.rollback()
+        return False
+    database.commit()
+    return True
+
+
+def update_operation_snapshot(operation: Operation, snapshot: OperationSnapshot, *,
+                              recovery_pending: bool | None = None) -> bool:
+    statement = _operation_update(operation, recovery_pending).where(
+        TableSubtitleCleanupOperations.id == snapshot.id,
+        TableSubtitleCleanupOperations.payload == snapshot.payload,
+        TableSubtitleCleanupOperations.job_id.is_not_distinct_from(snapshot.job_id),
+        TableSubtitleCleanupOperations.recovery_pending == snapshot.recovery_pending,
+    )
+    return _commit_operation(statement, operation['id'])
+
+
 def recovery_operations(video_path: str) -> list[Operation]:
-    rows = database.execute(select(TableSubtitleCleanupOperations.payload)
+    return [snapshot.operation() for snapshot in recovery_snapshots(video_path)]
+
+
+def recovery_snapshots(video_path: str) -> list[OperationSnapshot]:
+    rows = database.execute(select(TableSubtitleCleanupOperations.id, TableSubtitleCleanupOperations.payload,
+                                   TableSubtitleCleanupOperations.job_id, TableSubtitleCleanupOperations.recovery_pending)
                             .where(TableSubtitleCleanupOperations.video_path == os.path.normcase(video_path),
                                    TableSubtitleCleanupOperations.recovery_pending.is_(True))
                             .order_by(TableSubtitleCleanupOperations.created_at)).all()
-    return [json.loads(row.payload) for row in rows]
+    return [OperationSnapshot(row.id, row.payload, row.job_id, row.recovery_pending) for row in rows]
 
 
 def refresh_inventory(operation: Operation) -> None:

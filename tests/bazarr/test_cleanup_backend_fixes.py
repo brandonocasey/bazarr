@@ -1,3 +1,6 @@
+from pathlib import Path
+import subprocess
+import sys
 from threading import Event, Thread
 
 import pytest
@@ -170,15 +173,36 @@ def test_recovery_pending_survives_apply_failure_until_rollback_and_staging_clea
         return original(args[0], args[1], args[2], stop)
 
     monkeypatch.setattr(transactions, 'commit_changes', interrupt)
-    failed = _apply(library, operation)
+    apply_files = service._apply_files
+    foreign = service._workspace(operation) / 'foreign-workspace'
+    foreign.mkdir()
+    marker = foreign / 'foreign.txt'
+    marker.write_text('unowned staging must survive')
+
+    def replace_finished_workspace(current, job_id):
+        try:
+            return apply_files(current, job_id)
+        except OSError:
+            foreign.rename(current['staging_workspace']['path'])
+            raise
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service, '_apply_files', replace_finished_workspace)
+        failed = _apply(library, operation)
     assert failed['status'] == 'failed'
+    assert failed['error'] == 'Interrupted before replacement'
+    replacement = Path(failed['staging_workspace']['path'])
+    assert (replacement / marker.name).read_text() == 'unowned staging must survive'
     assert database.scalar(select(TableSubtitleCleanupOperations.recovery_pending).where(
         TableSubtitleCleanupOperations.id == operation['id'])) is True
+    (replacement / marker.name).unlink()
+    replacement.rmdir()
     with media_write_lock(str(video)):
         pass
     assert database.scalar(select(TableSubtitleCleanupOperations.recovery_pending).where(
         TableSubtitleCleanupOperations.id == operation['id'])) is False
     assert store.recovery_operations(str(video)) == []
+    assert store.get_operation(operation['id'])['error'] == failed['error']
 
 
 def test_recovery_migration_preserves_legacy_rows_and_is_additive():
@@ -188,19 +212,51 @@ def test_recovery_migration_preserves_legacy_rows_and_is_additive():
     from alembic.operations import Operations
 
     migration = import_module('migrations.versions.7d3e8b2f5a12_cleanup_recovery_pending')
+    previous = import_module('migrations.versions.6c2d7a9e4b11_subtitle_cleanup')
+    statuses = ['queued', 'analyzing', 'ready', 'applying', 'restoring', 'failed', 'complete', 'restored']
     legacy = sa.create_engine('sqlite://')
     with legacy.begin() as connection:
-        connection.exec_driver_sql('CREATE TABLE table_subtitle_cleanup_operations (id TEXT PRIMARY KEY, payload TEXT)')
-        connection.exec_driver_sql("INSERT INTO table_subtitle_cleanup_operations VALUES ('old', 'preserved')")
+        with Operations.context(MigrationContext.configure(connection)):
+            previous.upgrade()
+        for status in statuses:
+            connection.exec_driver_sql(
+                'INSERT INTO table_subtitle_cleanup_operations '
+                '(id, media_type, media_id, video_path, status, payload, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (status, 'movie', 1, '/missing/video.mkv', status, 'preserved', '2026-01-01'))
+        columns = [column['name'] for column in sa.inspect(connection).get_columns(
+            'table_subtitle_cleanup_operations')]
         with Operations.context(MigrationContext.configure(connection)):
             migration.upgrade()
             migration.upgrade()
         assert connection.exec_driver_sql(
-            'SELECT id, payload, recovery_pending FROM table_subtitle_cleanup_operations').all() == [
-                ('old', 'preserved', 1)]
+            'SELECT id, payload, recovery_pending FROM table_subtitle_cleanup_operations ORDER BY id').all() == [
+                (status, 'preserved', int(status in ('applying', 'restoring', 'failed')))
+                for status in sorted(statuses)]
         assert [column['name'] for column in sa.inspect(connection).get_columns(
-            'table_subtitle_cleanup_operations')] == ['id', 'payload', 'recovery_pending']
+            'table_subtitle_cleanup_operations')] == [*columns, 'recovery_pending']
+        connection.exec_driver_sql(
+            'INSERT INTO table_subtitle_cleanup_operations '
+            '(id, media_type, media_id, video_path, status, payload, created_at) '
+            "VALUES ('fresh', 'movie', 1, '/missing/fresh.mkv', 'queued', 'fresh payload', '2026-01-01')")
+        assert connection.exec_driver_sql(
+            "SELECT recovery_pending FROM table_subtitle_cleanup_operations WHERE id = 'fresh'").scalar() == 0
     legacy.dispose()
+
+
+def test_fresh_cleanup_table_defaults_to_inactive_recovery():
+    import sqlalchemy as sa
+
+    fresh = sa.create_engine('sqlite://')
+    TableSubtitleCleanupOperations.__table__.create(fresh)
+    with fresh.begin() as connection:
+        connection.exec_driver_sql(
+            'INSERT INTO table_subtitle_cleanup_operations '
+            '(id, media_type, media_id, video_path, status, payload, created_at) '
+            "VALUES ('fresh', 'movie', 1, '/missing/fresh.mkv', 'queued', '{}', '2026-01-01')")
+        assert connection.exec_driver_sql(
+            'SELECT recovery_pending FROM table_subtitle_cleanup_operations').scalar() == 0
+    fresh.dispose()
 
 
 def test_batch_status_uses_chunked_database_reads(library):
@@ -227,7 +283,8 @@ def test_batch_status_uses_chunked_database_reads(library):
     assert max(parameter_counts) <= SUBTITLE_MAP_QUERY_BATCH_SIZE
 
 
-def test_batch_status_preserves_new_job_claim_during_lock_acquisition(library, monkeypatch):
+@pytest.mark.parametrize('batch', [False, True])
+def test_batch_status_preserves_new_job_claim_during_lock_acquisition(library, monkeypatch, batch):
     from contextlib import contextmanager
 
     client, headers, media_id, video, *_ = library
@@ -242,14 +299,20 @@ def test_batch_status_preserves_new_job_claim_during_lock_acquisition(library, m
             yield
 
     monkeypatch.setattr(service, 'media_write_lock', claimed_lock)
-    response = client.post('/api/subtitles/cleanup/status', headers=headers,
-                           json={'operation_ids': [operation['id']]})
+    if batch:
+        response = client.post('/api/subtitles/cleanup/status', headers=headers,
+                               json={'operation_ids': [operation['id']]})
+        current = response.json['data'][0]['operation']
+    else:
+        response = client.get(f'/api/subtitles/cleanup/{operation["id"]}', headers=headers)
+        current = response.json
     assert response.status_code == 200
-    assert response.json['data'][0]['operation']['status'] == 'queued'
-    assert response.json['data'][0]['operation']['job_id'] == -2
+    assert current['status'] == 'queued'
+    assert current['job_id'] == -2
 
 
-def test_batch_status_observes_live_job_reactivation(library, monkeypatch):
+@pytest.mark.parametrize('batch', [False, True])
+def test_batch_status_observes_live_job_reactivation(library, monkeypatch, batch):
     from contextlib import contextmanager
 
     client, headers, media_id, *_ = library
@@ -265,10 +328,15 @@ def test_batch_status_observes_live_job_reactivation(library, monkeypatch):
             yield
 
     monkeypatch.setattr(service, 'media_write_lock', activated_lock)
-    response = client.post('/api/subtitles/cleanup/status', headers=headers,
-                           json={'operation_ids': [operation['id']]})
+    if batch:
+        response = client.post('/api/subtitles/cleanup/status', headers=headers,
+                               json={'operation_ids': [operation['id']]})
+        current = response.json['data'][0]['operation']
+    else:
+        response = client.get(f'/api/subtitles/cleanup/{operation["id"]}', headers=headers)
+        current = response.json
     assert response.status_code == 200
-    assert response.json['data'][0]['operation']['status'] == 'queued'
+    assert current['status'] == 'queued'
 
 
 def test_batch_status_isolates_unreadable_saved_row(library):
@@ -376,11 +444,31 @@ def test_concurrent_analysis_previews_only_publish_consistent_inputs(library, mo
             assert 'writer' in operation['error'].lower()
 
 
-def test_analysis_refuses_already_active_writer_before_reading(library):
+@pytest.mark.parametrize('pending_recovery', [False, True])
+def test_analysis_refuses_already_active_writer_before_reading(library, monkeypatch, pending_recovery):
     _, _, media_id, video, *_ = library
     operation = store.create_operation('movie', media_id, None)
+    if pending_recovery:
+        interrupted = store.create_operation('movie', media_id, None)
+        interrupted['status'] = 'applying'
+        store.update_operation(interrupted, recovery_pending=True)
     entered, release, done = Event(), Event(), Event()
-    errors = []
+    errors, inputs, reads = [], [], []
+    capture_inputs = planner.capture_inputs
+    from subtitles.cleanup import transactions
+    original_fingerprint = transactions.fingerprint
+
+    def capture(current):
+        inputs.append(current['id'])
+        return capture_inputs(current)
+
+    def fingerprint(path):
+        reads.append(path)
+        return original_fingerprint(path)
+
+    monkeypatch.setattr(planner, 'capture_inputs', capture)
+    monkeypatch.setattr(planner, 'fingerprint', fingerprint)
+    monkeypatch.setattr(transactions, 'fingerprint', fingerprint)
 
     def writer():
         try:
@@ -400,6 +488,8 @@ def test_analysis_refuses_already_active_writer_before_reading(library):
     writer_thread.start()
     try:
         assert entered.wait(5)
+        if pending_recovery:
+            store.update_operation(interrupted, recovery_pending=True)
         analysis_thread.start()
         assert done.wait(2), 'Analysis did not reject a writer that was already active'
     finally:
@@ -408,6 +498,8 @@ def test_analysis_refuses_already_active_writer_before_reading(library):
         if analysis_thread.ident is not None:
             analysis_thread.join(10)
     assert not errors
+    assert inputs == []
+    assert reads == []
     assert not writer_thread.is_alive() and not analysis_thread.is_alive()
     failed = store.get_operation(operation['id'])
     assert failed['status'] == 'failed'
@@ -480,3 +572,121 @@ def test_analysis_final_validation_does_not_block_writer_with_full_file_reads(li
             thread.join(5)
     assert all(acquired_during_final_reads), 'Final preview publication blocked a writer while hashing inputs'
     assert operation['status'] == 'ready', operation['error']
+
+
+def test_completed_rollback_retires_recovery_before_retry(library, monkeypatch):
+    from subtitles.cleanup import transactions
+    from tests.bazarr.test_cleanup_api import _apply, _preview
+
+    _, _, _, video, *_ = library
+    operation = _preview(library)
+    commit = transactions.commit_changes
+
+    def interrupt(*args, **kwargs):
+        def stop():
+            raise OSError('Interrupted before replacement')
+        return commit(args[0], args[1], args[2], stop)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transactions, 'commit_changes', interrupt)
+        failed = _apply(library, operation)
+    assert failed['status'] == 'failed'
+    assert failed['error'] == 'Interrupted before replacement'
+    assert failed['staging_workspace'] is None
+    assert store.recovery_operations(str(video)) == []
+    journal = transactions.read_journal(Path(failed['backup_path']))
+    assert journal['phase'] == 'rolled_back'
+    assert all(not Path(entry['backup']).exists() for entry in journal['entries'])
+    reads = []
+    fingerprint = transactions.fingerprint
+
+    def record_read(path):
+        reads.append(path)
+        return fingerprint(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transactions, 'fingerprint', record_read)
+        for _ in range(2):
+            with media_write_lock(str(video)):
+                pass
+        service.recover_interrupted_operations()
+    assert reads == []
+    assert store.get_operation(operation['id'])['error'] == failed['error']
+    assert _preview(library)['status'] == 'ready'
+
+
+@pytest.mark.parametrize('legacy_pending', [False, True])
+def test_settled_ownership_refusal_preserves_cause_without_rehashing(library, monkeypatch, legacy_pending):
+    import os
+    from subtitles.cleanup import transactions
+    from tests.bazarr.test_cleanup_api import _apply, _preview
+
+    _, _, _, video, *_ = library
+    operation = _preview(library)
+    chmod = os.chmod
+
+    def refuse_metadata(path, *args, **kwargs):
+        if 'originals' in Path(path).parts:
+            raise PermissionError('filesystem denied metadata preservation')
+        return chmod(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'chmod', refuse_metadata)
+        failed = _apply(library, operation)
+    assert failed['status'] == 'failed'
+    assert 'Cannot preserve metadata for original file' in failed['error']
+    assert 'Grant the Bazarr service account permission' in failed['error']
+    assert store.recovery_operations(str(video)) == []
+    if legacy_pending:
+        store.update_operation(failed, recovery_pending=True)
+    reads = []
+    fingerprint = transactions.fingerprint
+
+    def record_read(path):
+        reads.append(path)
+        return fingerprint(path)
+
+    monkeypatch.setattr(transactions, 'fingerprint', record_read)
+    for _ in range(2):
+        with media_write_lock(str(video)):
+            pass
+        service.recover_interrupted_operations()
+        assert store.get_operation(operation['id'])['error'] == failed['error']
+    assert reads == []
+    assert store.recovery_operations(str(video)) == []
+
+
+def test_analysis_repairs_actual_crashed_writer_before_repeated_previews(library, monkeypatch):
+    from app.get_args import args
+    from utilities.media_write_lock import media_write_state
+    from tests.bazarr.test_cleanup_api import _preview
+
+    _, _, _, video, *_ = library
+    script = """
+import os, sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / 'bazarr'))
+os.environ['NO_CLI'] = 'true'
+import bazarr.app.libs
+from app.get_args import args
+from utilities.media_write_lock import media_write_lock
+args.config_dir = sys.argv[2]
+with media_write_lock(sys.argv[1]):
+    os._exit(31)
+"""
+    child = subprocess.run([sys.executable, '-c', script, str(video), args.config_dir],
+                           capture_output=True, text=True, timeout=30)
+    assert child.returncode == 31, child.stderr
+    assert media_write_state(str(video)).active
+    states_before_inputs = []
+    capture_inputs = planner.capture_inputs
+
+    def capture_after_repair(current):
+        states_before_inputs.append(media_write_state(current['video_path']).active)
+        return capture_inputs(current)
+
+    monkeypatch.setattr(planner, 'capture_inputs', capture_after_repair)
+    for _ in range(2):
+        assert _preview(library)['status'] == 'ready'
+        assert not media_write_state(str(video)).active
+    assert states_before_inputs == [False, False]

@@ -4,8 +4,9 @@ import hmac
 import logging
 import shutil
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import CancelledError
+from contextlib import contextmanager, ExitStack
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,7 +15,7 @@ from uuid import UUID
 
 from app.get_args import args
 from app.jobs_queue import jobs_queue, Job, JobCanceled
-from utilities.media_write_lock import media_write_lock, media_write_state, register_media_write_guard
+from utilities.media_write_lock import MediaWriteState, media_write_lock, media_write_state, register_media_write_guard
 
 from . import media, planner, store, transactions
 from .models import MediaAnalysis
@@ -69,17 +70,9 @@ def preview(media_type: str, media_id: int, audio_stream_index: int | None = Non
     return _enqueue(operation, 'run_analysis')
 
 
-def _has_active_job(operation: Operation) -> bool:
-    job_id = operation['job_id']
-    if job_id is None:
-        return True
-    jobs = jobs_queue.list_jobs_from_queue(job_id=job_id)
-    return any(job['module'] == __name__ and job['kwargs'].get('operation_id') == operation['id']
-               and job['status'] in ('pending', 'running') for job in jobs)
-
-
 def get_operation(operation_id: str) -> Operation:
-    return _revalidate_inactive_operation(store.get_operation(operation_id), _has_active_job)
+    is_active = partial(_snapshot_job_is_active, jobs=jobs_queue.snapshot_jobs())
+    return _revalidate_inactive_operation(store.get_operation(operation_id), is_active)
 
 
 class OperationStatus(TypedDict):
@@ -162,17 +155,24 @@ def restore(operation_id: str, token: object) -> Operation:
     return _enqueue(operation, 'run_restore')
 
 
+def _analysis_writer_state(video_path: str, job_id: int | None) -> MediaWriteState:
+    writer_state = media_write_state(video_path)
+    if writer_state.active or store.recovery_operations(video_path):
+        try:
+            with media_write_lock(video_path, job_id=job_id, blocking=False):
+                pass
+        except BlockingIOError as error:
+            raise store.CleanupError('Media writer is active; create a fresh cleanup preview', 409) from error
+        writer_state = media_write_state(video_path)
+    return writer_state
+
+
 def run_analysis(operation_id: str, job_id: int | None = None) -> None:
     operation = store.get_operation(operation_id)
     operation['status'] = 'analyzing'
     store.update_operation(operation, previous=('queued',))
     try:
-        if store.recovery_operations(operation['video_path']):
-            with media_write_lock(operation['video_path'], job_id=job_id):
-                pass
-        writer_state = media_write_state(operation['video_path'])
-        if writer_state.active:
-            raise store.CleanupError('Media writer is active; create a fresh cleanup preview', 409)
+        writer_state = _analysis_writer_state(operation['video_path'], job_id)
         inputs = planner.capture_inputs(operation)
         planner.analyze_operation(operation, _workspace(operation), lambda: _cancelled(job_id), inputs)
         with media_write_lock(operation['video_path'], job_id=job_id) as previous_writer:
@@ -230,38 +230,46 @@ def _cleanup_staging(operation: Operation) -> None:
 
 
 def run_apply(operation_id: str, job_id: int | None = None) -> None:
-    operation = store.get_operation(operation_id)
-    try:
-        with media_write_lock(operation['video_path'], job_id=job_id):
-            operation = store.get_operation(operation_id)
-            if operation['status'] != 'applying':
-                return
-            # Staging MUST rearm recovery after the guard clears an empty claim.
-            store.update_operation(operation, previous=('applying',), recovery_pending=True)
-            journal = _apply_files(operation, job_id)
-            _finish(operation, journal)
-    except Exception as error:
-        _fail(operation, error)
+    with _locked_operation(operation_id, job_id) as operation:
+        if operation is None or operation['status'] != 'applying':
+            return
+        # Staging MUST rearm recovery after the guard clears an empty claim.
+        store.update_operation(operation, previous=('applying',), recovery_pending=True)
+        journal = _apply_files(operation, job_id)
+        _finish(operation, journal)
 
 
 def run_restore(operation_id: str, job_id: int | None = None) -> None:
-    operation = store.get_operation(operation_id)
-    try:
-        with media_write_lock(operation['video_path'], job_id=job_id):
-            operation = store.get_operation(operation_id)
-            if operation['status'] != 'restoring':
-                return
-            if _cancelled(job_id):
-                operation['status'] = 'complete'
-                store.update_operation(operation, recovery_pending=False)
-                return
-            journal = transactions.restore_transaction(_directory(operation))
-            _finish(operation, journal)
-    except Exception as error:
-        _fail(operation, error)
+    with _locked_operation(operation_id, job_id) as operation:
+        if operation is None or operation['status'] != 'restoring':
+            return
+        if _cancelled(job_id):
+            operation['status'] = 'complete'
+            store.update_operation(operation, recovery_pending=False)
+            return
+        journal = transactions.restore_transaction(_directory(operation))
+        _finish(operation, journal)
 
 
-def _finish(operation: Operation, journal: Journal) -> None:
+@contextmanager
+def _locked_operation(operation_id: str, job_id: int | None) -> Iterator[Operation | None]:
+    snapshot = store.get_operation_snapshot(operation_id)
+    operation = snapshot.operation()
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(media_write_lock(operation['video_path'], job_id=job_id))
+        except Exception as error:
+            _fail_before_lock(snapshot, error)
+            yield None
+            return
+        operation = store.get_operation(operation_id)
+        try:
+            yield operation
+        except Exception as error:
+            _fail(operation, error)
+
+
+def _finish(operation: Operation, journal: Journal, snapshot: store.OperationSnapshot | None = None) -> bool:
     _cleanup_staging(operation)
     restored = journal['phase'] == 'restored'
     operation['status'] = 'restored' if restored else 'complete'
@@ -274,51 +282,102 @@ def _finish(operation: Operation, journal: Journal) -> None:
         'restored_files': [entry['path'] for entry in journal['entries']] if restored else [],
     }
     operation['error'] = None
-    store.update_operation(operation)
+    pending = False
     try:
         store.refresh_inventory(operation)
-        store.update_operation(operation, recovery_pending=False)
     except Exception as error:
         operation['error'] = f'Files verified, but inventory refresh failed: {error}'
-        store.update_operation(operation)
+        pending = True
         logging.exception('Subtitle cleanup inventory refresh failed')
+    if snapshot is not None:
+        return store.update_operation_snapshot(operation, snapshot, recovery_pending=pending)
+    store.update_operation(operation, recovery_pending=pending)
+    return True
 
 
-def _fail(operation: Operation, error: Exception) -> None:
+def _record_failure(operation: Operation, error: Exception) -> tuple[Journal | None, Exception]:
     try:
         journal = transactions.read_journal(_directory(operation))
     except (OSError, ValueError) as journal_error:
         journal = None
         error = RuntimeError(f'{error}; journal recovery requires attention: {journal_error}')
-    status = 'complete' if operation['status'] == 'restoring' and journal and journal['phase'] == 'complete' else 'failed'
-    operation.update(status=status, error=str(error))
-    store.update_operation(operation)
-    if isinstance(error, (CancelledError, JobCanceled)):
+    refused_restore = operation['status'] == 'restoring' and journal is not None and journal['phase'] == 'complete'
+    operation.update(status='complete' if refused_restore else 'failed', error=str(error))
+    return journal, error
+
+
+def _fail_before_lock(snapshot: store.OperationSnapshot, error: Exception) -> None:
+    canceled = isinstance(error, (CancelledError, JobCanceled))
+    while True:
+        operation = snapshot.operation()
+        journal, failure = _record_failure(operation, error)
+        settled_restore = journal is not None and operation['status'] == 'complete' \
+            and operation.get('staging_workspace') is None
+        pending = False if settled_restore else None
+        if store.update_operation_snapshot(operation, snapshot, recovery_pending=pending):
+            break
+        current = store.get_operation_snapshot(snapshot.id)
+        if current.payload != snapshot.payload or current.recovery_pending != snapshot.recovery_pending:
+            break
+        snapshot = current
+    if canceled:
+        raise JobCanceled(str(failure)) from error
+    logging.exception('Subtitle cleanup operation %s could not acquire its media lock', snapshot.id)
+
+
+def _fail(operation: Operation, error: Exception) -> None:
+    canceled = isinstance(error, (CancelledError, JobCanceled))
+    journal, error = _record_failure(operation, error)
+    retired = False
+    if journal is not None and (operation['status'] == 'complete' or journal['phase'] == 'rolled_back'):
+        try:
+            if journal['phase'] == 'rolled_back':
+                transactions.discard_rollback_backups(_directory(operation))
+            _cleanup_staging(operation)
+            retired = True
+        except (OSError, ValueError):
+            logging.exception('Subtitle cleanup failure staging requires recovery for %s', operation['id'])
+    store.update_operation(operation, recovery_pending=False if retired else None)
+    if canceled:
         raise JobCanceled(str(error)) from error
     logging.exception('Subtitle cleanup operation %s failed', operation['id'])
 
 
 def recover_for_media(video_path: str) -> bool:
     recovered = False
-    for operation in store.recovery_operations(video_path):
-        directory = _directory(operation)
-        journal = transactions.read_journal(directory)
-        if journal is None:
-            _cleanup_staging(operation)
-            store.update_operation(operation, recovery_pending=False)
-            continue
-        if journal['phase'] == 'complete' and operation['status'] == 'restoring':
-            continue
-        needs_recovery = journal['phase'] != 'rolled_back'
-        journal = transactions.recover_transaction(directory)
-        recovered = recovered or needs_recovery
-        _cleanup_staging(operation)
-        if journal['phase'] in ('complete', 'restored'):
-            _finish(operation, journal)
-        elif journal['phase'] == 'rolled_back':
-            operation.update(status='failed', error='Interrupted cleanup was rolled back; create a fresh preview')
-            store.update_operation(operation, recovery_pending=False)
+    for snapshot in store.recovery_snapshots(video_path):
+        recovered = _recover_snapshot(snapshot) or recovered
     return recovered
+
+
+def _recover_snapshot(snapshot: store.OperationSnapshot) -> bool:
+    recovered = False
+    while snapshot.recovery_pending:
+        settled, recovered_changes = _recover_snapshot_once(snapshot)
+        recovered = recovered_changes or recovered
+        if settled:
+            return recovered
+        snapshot = store.get_operation_snapshot(snapshot.id)
+    return recovered
+
+
+def _recover_snapshot_once(snapshot: store.OperationSnapshot) -> tuple[bool, bool]:
+    operation = snapshot.operation()
+    directory = _directory(operation)
+    journal = transactions.read_journal(directory)
+    if journal is None:
+        _cleanup_staging(operation)
+        return store.update_operation_snapshot(operation, snapshot, recovery_pending=False), False
+    if journal['phase'] == 'complete' and operation['status'] == 'restoring':
+        return True, False
+    needs_recovery = journal['phase'] != 'rolled_back'
+    journal = transactions.recover_transaction(directory)
+    _cleanup_staging(operation)
+    if journal['phase'] in ('complete', 'restored'):
+        return _finish(operation, journal, snapshot), needs_recovery
+    operation.update(status='failed', error=operation['error'] or
+                     'Interrupted cleanup was rolled back; create a fresh preview')
+    return store.update_operation_snapshot(operation, snapshot, recovery_pending=False), needs_recovery
 
 
 def _recover_operation(operation: Operation) -> None:
