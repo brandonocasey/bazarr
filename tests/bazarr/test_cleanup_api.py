@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -237,7 +238,8 @@ def test_queued_preview_cannot_change_its_locked_media_identity(library):
     assert 'changed before analysis' in failed['error']
     recovery_key = database.scalar(select(TableSubtitleCleanupOperations.video_path)
                                    .where(TableSubtitleCleanupOperations.id == failed['id']))
-    assert recovery_key == failed['video_path'] == str(video)
+    assert failed['video_path'] == str(video)
+    assert recovery_key == os.path.normcase(str(video))
     assert failed['analysis'] is None and not Path(failed['backup_path']).exists()
     assert {path: _sha(path) for path in before} == before
 
