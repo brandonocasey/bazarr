@@ -175,7 +175,7 @@ def _fresh_sidecar_owner(subtitle_path: str, video_path: str) -> str:
 
     canonical_subtitle = _canonical_path(subtitle_path)
     canonical_video = _canonical_path(video_path)
-    stem = os.path.splitext(os.path.basename(canonical_video))[0]
+    stem = os.path.splitext(os.path.basename(os.path.normcase(video_path)))[0]
     if (os.path.dirname(canonical_subtitle) not in _output_locations(video_path)
             or not os.path.basename(canonical_subtitle).startswith(stem + '.')
             or os.path.splitext(canonical_subtitle)[1] not in SUBTITLE_EXTENSIONS):

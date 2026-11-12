@@ -187,6 +187,24 @@ def _patch_common(monkeypatch, subsyncer=FakeSubSyncer):
     FakeSubSyncer.calls = []
 
 
+@pytest.fixture
+def callback_queue(monkeypatch):
+    from app.jobs_queue import JobsQueue
+
+    queue = JobsQueue()
+    monkeypatch.setattr(sync_module, "jobs_queue", queue)
+    return queue
+
+
+def _finish_callback(queue, calls):
+    assert calls == []
+    assert len(queue.jobs_pending_queue) == 1
+    job = queue.jobs_pending_queue[0]
+    assert not job.is_sync
+    assert queue.force_start_pending_job(job.job_id) is True
+    assert list(queue.jobs_pending_queue) == []
+
+
 def _sync_with_callback(callback, percent_score=100):
     return sync_module.sync_subtitles(
         video_path="/media/movie.mkv",
@@ -201,17 +219,17 @@ def _sync_with_callback(callback, percent_score=100):
     )
 
 
-def test_sync_subtitles_runs_callback_after_sync(monkeypatch):
+def test_sync_subtitles_runs_callback_after_sync(monkeypatch, callback_queue):
     _patch_common(monkeypatch)
     monkeypatch.setattr(sync_module.settings.subsync, "use_subsync_movie_threshold", False)
     calls = []
 
     assert _sync_with_callback(lambda: calls.append(len(FakeSubSyncer.calls))) is True
-    # callback runs once, after the sync itself
+    _finish_callback(callback_queue, calls)
     assert calls == [1]
 
 
-def test_sync_subtitles_runs_callback_when_threshold_skips_sync(monkeypatch):
+def test_sync_subtitles_runs_callback_when_threshold_skips_sync(monkeypatch, callback_queue):
     _patch_common(monkeypatch)
     monkeypatch.setattr(sync_module.settings.subsync, "use_subsync_movie_threshold", True)
     monkeypatch.setattr(sync_module.settings.subsync, "subsync_movie_threshold", 70)
@@ -219,15 +237,17 @@ def test_sync_subtitles_runs_callback_when_threshold_skips_sync(monkeypatch):
 
     assert _sync_with_callback(lambda: calls.append(True), percent_score=100) is False
     assert FakeSubSyncer.calls == []
+    _finish_callback(callback_queue, calls)
     assert calls == [True]
 
 
-def test_sync_subtitles_runs_callback_when_sync_fails(monkeypatch):
+def test_sync_subtitles_runs_callback_when_sync_fails(monkeypatch, callback_queue):
     _patch_common(monkeypatch, subsyncer=FailingSubSyncer)
     monkeypatch.setattr(sync_module.settings.subsync, "use_subsync_movie_threshold", False)
     calls = []
 
     assert _sync_with_callback(lambda: calls.append(True)) is False
+    _finish_callback(callback_queue, calls)
     assert calls == [True]
 
 
@@ -283,14 +303,14 @@ class CanceledSubSyncer:
         raise sync_module.JobCanceled
 
 
-def test_sync_subtitles_propagates_cancel_and_runs_callback(monkeypatch):
+def test_sync_subtitles_propagates_cancel_and_runs_callback(monkeypatch, callback_queue):
     _patch_common(monkeypatch, subsyncer=CanceledSubSyncer)
     monkeypatch.setattr(sync_module.settings.subsync, "use_subsync_movie_threshold", False)
     calls = []
 
     with pytest.raises(sync_module.JobCanceled):
         _sync_with_callback(lambda: calls.append(True))
-    # the downloaded subtitles are still there (unsynced), so post-processing and notifications still happen
+    _finish_callback(callback_queue, calls)
     assert calls == [True]
 
 

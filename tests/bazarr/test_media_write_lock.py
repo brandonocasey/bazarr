@@ -523,3 +523,235 @@ def test_mapped_subtitle_and_video_use_local_canonical_identity(media, memory_se
     memory_session.commit()
     monkeypatch.setattr(path_mappings, 'path_mapping_movies', [('/radarr', str(video.parent))])
     assert coordination.subtitle_media_path(str(subtitle), str(video)) == str(video)
+
+
+@pytest.mark.parametrize('extension', ['.srt', '.vtt'])
+@pytest.mark.parametrize('destination', ['current', 'relative', 'absolute'])
+def test_fresh_saved_sidecar_uses_symlink_video_spelling(media, guard, memory_session, monkeypatch,
+                                                       tmp_path, extension, destination):
+    from app.config import settings
+    from app.database import TableMovies
+    from subliminal_patch.core import get_subtitle_path
+    from subtitles.tools.translate.main import translate_subtitles_file
+    from subzero.language import Language
+
+    video, _, _ = media
+    store = tmp_path / 'store'
+    store.mkdir()
+    target = store / 'release.mkv'
+    video.rename(target)
+    video.symlink_to(target)
+    monkeypatch.setattr(settings.general, 'subfolder', destination)
+    custom = str(tmp_path / 'captions') if destination == 'absolute' else 'captions'
+    monkeypatch.setattr(settings.general, 'subfolder_custom', custom)
+    folder = tmp_path / 'captions' if destination != 'current' else video.parent
+    folder.mkdir(exist_ok=True)
+    source = folder / Path(get_subtitle_path(str(video), Language('fra'), extension=extension)).name
+    source.write_text('1\n00:00:00,000 --> 00:00:01,000\nHello!\n')
+    assert memory_session.get(TableMovies, 7).path == str(video)
+    assert coordination.subtitle_media_path(str(source), str(video), allow_unindexed=True) == str(target)
+    guard(lambda path: (_ for _ in ()).throw(RecoveryRequired(path)))
+    with pytest.raises(RecoveryRequired, match='release.mkv'):
+        translate_subtitles_file(str(video), str(source), 'fr', 'en', False, False,
+                                 'movie', None, None, 7, None, job_id=1)
+
+
+@pytest.fixture
+def queued_processing(media, guard, memory_session, monkeypatch, tmp_path):
+    import shlex
+    import app.database as app_database
+    import app.jobs_queue as queue_module
+    from sqlalchemy.orm import scoped_session, sessionmaker
+    from subtitles import processing, sync
+    from bazarr.subtitles import sync as queued_sync
+    from subtitles.tools import subsyncer
+    from subzero.language import Language
+
+    video, subtitle, _ = media
+    db = scoped_session(sessionmaker(bind=memory_session.get_bind()))
+    for module in (app_database, queue_module, processing):
+        monkeypatch.setattr(module, 'database', db)
+    queue = queue_module.JobsQueue()
+    for module in (queue_module, sync, queued_sync, subsyncer):
+        monkeypatch.setattr(module, 'jobs_queue', queue)
+    settings = processing.settings
+    for key, value in {'use_postprocessing': True, 'use_postprocessing_threshold_movie': False,
+                       'chmod_enabled': True, 'chmod': '0640', 'use_plex': False, 'use_jellyfin': False}.items():
+        monkeypatch.setattr(settings.general, key, value)
+    monkeypatch.setattr(settings.subsync, 'use_subsync', True)
+    monkeypatch.setattr(settings.subsync, 'use_subsync_movie_threshold', False)
+    monkeypatch.setattr(settings.subsync.checker, 'blacklisted_providers', [])
+    output = tmp_path / 'postprocessed'
+    command = [sys.executable, '-c',
+               'from pathlib import Path; import sys; Path(sys.argv[1]).write_text("processed")', str(output)]
+    monkeypatch.setattr(settings.general, 'postprocessing_cmd', shlex.join(command))
+    notifications = []
+    notified = threading.Event()
+
+    def notify(radarr_id):
+        notifications.append((radarr_id, output.read_text(), subtitle.stat().st_mode & 0o777))
+        notified.set()
+
+    monkeypatch.setattr(processing, 'notify_radarr', notify)
+    monkeypatch.setattr(processing, 'call_external_webhook', lambda **kwargs: None)
+    monkeypatch.setattr(processing.event_tracker, 'track_subtitles', lambda **kwargs: None)
+    saved = SimpleNamespace(provider_name='fixture', uploader='user', release_info='release', language=Language('eng'),
+                            storage_path=str(subtitle), id='1', score=100, matches=set())
+
+    def process():
+        return processing.process_subtitle(saved, 'movie', 'English', str(video), 100, job_id=999)
+
+    try:
+        yield SimpleNamespace(queue=queue, process=process, output=output, subtitle=subtitle, video=video,
+                              notifications=notifications, notified=notified, settings=settings)
+    finally:
+        db.remove()
+
+
+def test_queued_sync_cancellation_releases_slot_and_retains_postprocessing(queued_processing):
+    from concurrent.futures import TimeoutError
+    from app.get_args import args
+
+    state = queued_processing
+    assert state.process() is not None
+    sync_job = state.queue.jobs_pending_queue[0]
+    ready = state.video.parent / 'holder-ready'
+    script = """
+import os,sys
+os.environ['NO_CLI']='true'
+import bazarr.app.libs
+from app.get_args import args
+from utilities.media_write_lock import media_write_lock
+from pathlib import Path
+args.config_dir=sys.argv[1]
+with media_write_lock(sys.argv[2]):
+    Path(sys.argv[3]).write_text('locked')
+    sys.stdin.read(1)
+"""
+    environment = dict(os.environ)
+    environment['PYTHONPATH'] = os.pathsep.join((str(Path.cwd()), str(Path.cwd() / 'bazarr')))
+    holder = subprocess.Popen([sys.executable, '-c', script, args.config_dir, str(state.video), str(ready)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=environment, text=True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        released = False
+        try:
+            for _ in range(500):
+                if ready.exists():
+                    break
+                threading.Event().wait(0.01)
+            assert ready.exists(), 'independent holder did not acquire lock'
+            future = pool.submit(state.queue.force_start_pending_job, sync_job.job_id)
+            for _ in range(500):
+                if state.queue.get_job(sync_job.job_id) is not None:
+                    break
+                threading.Event().wait(0.01)
+            assert state.queue.get_job(sync_job.job_id) is sync_job
+            state.queue.cancel_running_job(sync_job.job_id)
+            assert future.result(timeout=2) is True
+            assert sync_job.status == 'canceled'
+            assert holder.poll() is None
+            assert not any(job.is_sync for job in state.queue.jobs_running_queue)
+            assert not state.output.exists()
+            assert not state.notifications
+            finishing = state.queue.jobs_pending_queue[0]
+            assert not finishing.is_sync
+            finish = pool.submit(state.queue.force_start_pending_job, finishing.job_id)
+            with pytest.raises(TimeoutError):
+                finish.result(timeout=0.15)
+            holder.communicate('x', timeout=5)
+            released = True
+            assert finish.result(timeout=5) is True
+            assert finishing.status == 'completed'
+            assert state.notifications == [(7, 'processed', 0o640)]
+        finally:
+            if not released:
+                holder.communicate('x', timeout=5)
+
+
+@pytest.mark.parametrize('outcome', ['skipped', 'disabled', 'removed', 'emptied'])
+def test_queued_sync_callback_keeps_postprocessing_after_other_exits(queued_processing, outcome):
+    state = queued_processing
+    assert state.process() is not None
+    sync_job = state.queue.jobs_pending_queue[0]
+    if outcome == 'removed':
+        assert state.queue.remove_job_from_pending_queue(sync_job.job_id) is True
+    elif outcome == 'emptied':
+        assert state.queue.empty_jobs_queue('pending') is True
+    else:
+        if outcome == 'disabled':
+            state.settings.subsync.use_subsync = False
+        else:
+            state.settings.subsync.use_subsync_movie_threshold = True
+            state.settings.subsync.subsync_movie_threshold = 70
+        assert state.queue.force_start_pending_job(sync_job.job_id) is True
+    for _ in range(500):
+        if state.queue.jobs_pending_queue:
+            break
+        threading.Event().wait(0.01)
+    assert not state.output.exists()
+    assert not state.notifications
+    finishing = state.queue.jobs_pending_queue[0]
+    assert not finishing.is_sync
+    assert state.queue.force_start_pending_job(finishing.job_id) is True
+    assert state.notified.wait(2)
+    assert state.notifications == [(7, 'processed', 0o640)]
+
+
+def test_deferred_postprocessing_does_not_inherit_download_cancellation(queued_processing):
+    from app.jobs_queue import Job
+
+    state = queued_processing
+    assert state.process() is not None
+    download_job = Job(999, 'download', 'subtitles.download', 'generate_subtitles', args=[], kwargs={})
+    download_job.cancel_event.set()
+    state.queue.jobs_running_queue.append(download_job)
+    state.settings.subsync.use_subsync_movie_threshold = True
+    state.settings.subsync.subsync_movie_threshold = 70
+    sync_job = state.queue.jobs_pending_queue[0]
+    assert state.queue.force_start_pending_job(sync_job.job_id) is True
+    finishing = state.queue.jobs_pending_queue[0]
+    assert state.queue.force_start_pending_job(finishing.job_id) is True
+    assert state.notifications == [(7, 'processed', 0o640)]
+
+
+@pytest.mark.parametrize('action', ['remove', 'empty'])
+def test_removing_deferred_callback_keeps_required_postprocessing(queued_processing, action):
+    state = queued_processing
+    assert state.process() is not None
+    state.settings.subsync.use_subsync_movie_threshold = True
+    state.settings.subsync.subsync_movie_threshold = 70
+    sync_job = state.queue.jobs_pending_queue[0]
+    assert state.queue.force_start_pending_job(sync_job.job_id) is True
+    finishing = state.queue.jobs_pending_queue[0]
+    if action == 'remove':
+        assert state.queue.remove_job_from_pending_queue(finishing.job_id) is True
+    else:
+        assert state.queue.empty_jobs_queue('pending') is True
+    assert state.notified.wait(5)
+    assert state.notifications == [(7, 'processed', 0o640)]
+    assert not state.queue.jobs_pending_queue
+
+
+@pytest.mark.parametrize('canceled', [False, True])
+def test_synchronous_processing_uses_current_download_cancellation(queued_processing, monkeypatch, canceled):
+    from app.jobs_queue import Job, JobCanceled
+    from subtitles import processing
+
+    state = queued_processing
+    state.settings.subsync.use_subsync = False
+    download_job = Job(999, 'download', 'subtitles.download', 'generate_subtitles', args=[], kwargs={})
+    state.queue.jobs_running_queue.append(download_job)
+    notifications = []
+    monkeypatch.setattr(processing, 'notify_radarr', lambda radarr_id: notifications.append(radarr_id))
+    if canceled:
+        download_job.cancel_event.set()
+        with pytest.raises(JobCanceled):
+            state.process()
+        assert not state.output.exists()
+    else:
+        assert state.process() is not None
+        assert state.output.read_text() == 'processed'
+        assert state.subtitle.stat().st_mode & 0o777 == 0o640
+    assert notifications == [7]
+    assert not state.queue.jobs_pending_queue
