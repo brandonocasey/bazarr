@@ -251,8 +251,9 @@ def recover_for_media(video_path: str) -> bool:
             continue
         if journal['phase'] == 'complete' and operation['status'] == 'restoring':
             continue
+        needs_recovery = journal['phase'] != 'rolled_back'
         journal = transactions.recover_transaction(directory)
-        recovered = True
+        recovered = recovered or needs_recovery
         _cleanup_staging(operation)
         if journal['phase'] in ('complete', 'restored'):
             _finish(operation, journal)

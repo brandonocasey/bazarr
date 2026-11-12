@@ -139,6 +139,43 @@ def test_completed_journal_recovery_invalidates_unchanged_file_selection(library
     assert _sha(video) == before
 
 
+def test_rolled_back_journal_allows_fresh_extraction_retries(library, monkeypatch):
+    from app.jobs_queue import JobCanceled
+    from subtitles import embedded
+    from subtitles.cleanup import transactions
+    from subtitles.cleanup.models import PreparedFile
+    from tests.bazarr.test_embedded_cleanup_selection import ProbeReached
+
+    _, _, media_id, video, aligned, lower = library
+    operation = _preview(library)
+    before = {path: _sha(path) for path in (video, aligned, lower)}
+
+    def cancel():
+        raise JobCanceled('canceled before replacement')
+
+    directory = Path(operation['backup_path'])
+    with pytest.raises(JobCanceled):
+        transactions.commit_changes(directory, [PreparedFile(str(lower), None)],
+                                     [transactions.fingerprint(str(lower))], cancel)
+    assert transactions.read_journal(directory)['phase'] == 'rolled_back'
+    operation['status'] = 'failed'
+    store.update_operation(operation)
+    track = TableMoviesSubtitles(radarrId=media_id, embedded_track_id=2, language='en', forced=False, hi=False)
+    database.add(track)
+    database.commit()
+    subtitle_id = track.id
+
+    def probe(path):
+        assert path == str(video)
+        raise ProbeReached('fresh extraction reached media probing')
+
+    monkeypatch.setattr(embedded, 'FFprobeVideoContainer', probe)
+    for _ in range(2):
+        with pytest.raises(ProbeReached):
+            embedded.extract_embedded_subtitle(subtitle_id, 'movie', job_id=999999)
+    assert {path: _sha(path) for path in (video, aligned, lower)} == before
+
+
 def test_preview_auth_validation_and_indexed_identity(library):
     client, headers, media_id, *_ = library
     assert client.post('/api/subtitles/cleanup/preview', json={}).status_code == 401
