@@ -12,7 +12,8 @@ from app.database import (database, select, update, TableSubtitleCleanupOperatio
                           TableEpisodes, TableMoviesSubtitles, TableEpisodesSubtitles,
                           TableHistory, TableHistoryMovie, SUBTITLE_MAP_QUERY_BATCH_SIZE)
 from utilities.path_mappings import path_mappings
-from utilities.helper import get_subtitle_output_directories
+from utilities.helper import (SubtitleDirectorySettings, get_subtitle_directory_settings,
+                              get_subtitle_output_directories)
 from utilities.subtitle_ownership import indexed_subtitle_owners
 
 
@@ -78,7 +79,8 @@ def _video_paths() -> list[Path]:
     return videos
 
 
-def _index_video_owners(videos: list[Path]) -> dict[Path, dict[str, set[str]]]:
+def _index_video_owners(videos: list[Path],
+                        configuration: SubtitleDirectorySettings) -> dict[Path, dict[str, set[str]]]:
     owners: dict[Path, dict[str, set[str]]] = {}
     directories: dict[Path, Path] = {}
     for video in videos:
@@ -86,7 +88,7 @@ def _index_video_owners(videos: list[Path]) -> dict[Path, dict[str, set[str]]]:
             directories[video.parent] = Path(os.path.normcase(os.path.realpath(video.parent)))
         parent = directories[video.parent]
         identity = os.path.normcase(str(parent / video.name))
-        for directory in get_subtitle_output_directories(str(video)):
+        for directory in get_subtitle_output_directories(str(video), configuration):
             if directory not in directories:
                 directories[directory] = Path(os.path.normcase(os.path.realpath(directory)))
             names = owners.setdefault(directories[directory], {})
@@ -126,10 +128,11 @@ def _scan_subtitle_locations(locations: set[Path]) -> tuple[list[Path], list[Pat
 
 
 def _sidecar_files(video: Path) -> list[Path]:
+    configuration = get_subtitle_directory_settings()
     locations = {Path(os.path.normcase(os.path.realpath(path)))
-                 for path in get_subtitle_output_directories(str(video))}
+                 for path in get_subtitle_output_directories(str(video), configuration)}
     videos, candidates = _scan_subtitle_locations(locations)
-    owners = _index_video_owners([video, *_video_paths(), *videos])
+    owners = _index_video_owners([video, *_video_paths(), *videos], configuration)
     identity = os.path.normcase(str(video))
     found = []
     for path in candidates:
