@@ -68,6 +68,57 @@ def _language_from_alpha2(code2):
     return custom.subzero_language()
 
 
+def _media_file_identity(path):
+    info = os.stat(path)
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _embedded_media_title(data, media_type):
+    if media_type == 'episode':
+        return f'{data.seriesTitle} - S{data.season:02d}E{data.episode:02d} - {data.title}'
+    return f'{data.title} ({data.year})'
+
+
+def _load_subtitle_record(subtitles_id, media_type):
+    if media_type == 'episode':
+        return database.execute(
+            select(TableEpisodesSubtitles.embedded_track_id,
+                   TableEpisodesSubtitles.language,
+                   TableEpisodesSubtitles.forced,
+                   TableEpisodesSubtitles.hi,
+                   TableEpisodesSubtitles.sonarrEpisodeId,
+                   TableEpisodesSubtitles.sonarrSeriesId,
+                   TableEpisodes.path,
+                   TableShows.title.label('seriesTitle'),
+                   TableShows.year,
+                   TableShows.imdbId,
+                   TableShows.tvdbId,
+                   TableEpisodes.season,
+                   TableEpisodes.episode,
+                   TableEpisodes.title,
+                   TableEpisodes.audio_language,)
+            .join(TableEpisodes, TableEpisodes.sonarrEpisodeId == TableEpisodesSubtitles.sonarrEpisodeId)
+            .join(TableShows, TableShows.sonarrSeriesId == TableEpisodes.sonarrSeriesId)
+            .where(TableEpisodesSubtitles.id == subtitles_id)) \
+            .first()
+    else:
+        return database.execute(
+            select(TableMoviesSubtitles.embedded_track_id,
+                   TableMoviesSubtitles.language,
+                   TableMoviesSubtitles.forced,
+                   TableMoviesSubtitles.hi,
+                   TableMoviesSubtitles.radarrId,
+                   TableMovies.path,
+                   TableMovies.title,
+                   TableMovies.year,
+                   TableMovies.imdbId,
+                   TableMovies.tmdbId,
+                   TableMovies.audio_language,)
+            .join(TableMovies, TableMovies.radarrId == TableMoviesSubtitles.radarrId)
+            .where(TableMoviesSubtitles.id == subtitles_id)) \
+            .first()
+
+
 def extract_embedded_subtitle(subtitles_id, media_type, job_id=None, filename_suffix=''):
     """Extract an embedded subtitles track to an external subtitles file.
 
@@ -91,56 +142,14 @@ def extract_embedded_subtitle(subtitles_id, media_type, job_id=None, filename_su
         jobs_queue.add_job_from_function("Extracting embedded subtitles", is_progress=False)
         return False
 
-    # Look up the subtitles record together with its media file path
-    if media_type == 'episode':
-        data = database.execute(
-            select(TableEpisodesSubtitles.embedded_track_id,
-                   TableEpisodesSubtitles.language,
-                   TableEpisodesSubtitles.forced,
-                   TableEpisodesSubtitles.hi,
-                   TableEpisodesSubtitles.sonarrEpisodeId,
-                   TableEpisodesSubtitles.sonarrSeriesId,
-                   TableEpisodes.path,
-                   TableShows.title.label('seriesTitle'),
-                   TableShows.year,
-                   TableShows.imdbId,
-                   TableShows.tvdbId,
-                   TableEpisodes.season,
-                   TableEpisodes.episode,
-                   TableEpisodes.title,
-                   TableEpisodes.audio_language,)
-            .join(TableEpisodes, TableEpisodes.sonarrEpisodeId == TableEpisodesSubtitles.sonarrEpisodeId)
-            .join(TableShows, TableShows.sonarrSeriesId == TableEpisodes.sonarrSeriesId)
-            .where(TableEpisodesSubtitles.id == subtitles_id)) \
-            .first()
-    else:
-        data = database.execute(
-            select(TableMoviesSubtitles.embedded_track_id,
-                   TableMoviesSubtitles.language,
-                   TableMoviesSubtitles.forced,
-                   TableMoviesSubtitles.hi,
-                   TableMoviesSubtitles.radarrId,
-                   TableMovies.path,
-                   TableMovies.title,
-                   TableMovies.year,
-                   TableMovies.imdbId,
-                   TableMovies.tmdbId,
-                   TableMovies.audio_language,)
-            .join(TableMovies, TableMovies.radarrId == TableMoviesSubtitles.radarrId)
-            .where(TableMoviesSubtitles.id == subtitles_id)) \
-            .first()
+    data = _load_subtitle_record(subtitles_id, media_type)
 
     if not data:
         jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract a non-existing subtitles record "
                                                                f"{subtitles_id}")
         raise SubtitlesNotFoundError(f"No {media_type} subtitles record found with id {subtitles_id}")
-    else:
-        if media_type == 'episode':
-            media_title = f'{data.seriesTitle} - S{data.season:02d}E{data.episode:02d} - {data.title}'
-        else:
-            media_title = f'{data.title} ({data.year})'
-
-        jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Extracting embedded subtitles for {media_title}")
+    media_title = _embedded_media_title(data, media_type)
+    jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Extracting embedded subtitles for {media_title}")
 
     if data.embedded_track_id is None:
         jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract a non-embedded subtitles track "
@@ -155,7 +164,15 @@ def extract_embedded_subtitle(subtitles_id, media_type, job_id=None, filename_su
         video_path = path_mappings.path_replace_movie(data.path)
         media_id = data.radarrId
 
+    source_identity = _media_file_identity(video_path)
+    selected_data = _load_subtitle_record(subtitles_id, media_type)
     with media_write_lock(video_path, job_id=job_id):
+        if (selected_data != data or _load_subtitle_record(subtitles_id, media_type) != data
+                or _media_file_identity(video_path) != source_identity):
+            jobs_queue.update_job_name(job_id=job_id,
+                                       new_job_name=f"Failed to extract changed embedded subtitles in {video_path}")
+            raise EmbeddedSubtitlesExtractionError(
+                f"Selected embedded subtitles or media file changed before extraction: {video_path}")
         if not os.path.isfile(video_path):
             jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract embedded subtitles for video file "
                                                                    f"{video_path}")

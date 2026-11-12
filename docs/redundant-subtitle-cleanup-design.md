@@ -80,6 +80,8 @@ Unsupported versions or preservation failures must leave originals intact and re
 13. Refuse restoration that would overwrite later edits.
 14. Reindex rewritten streams and show the actual resulting subtitle inventory.
 
+Queued extraction rechecks its selected subtitle and media file after acquiring the lock.
+
 Multiple file replacements are not one atomic operation.
 The journal and recovery protocol must handle partial commits.
 Bazarr locks cannot coordinate independent Sonarr, Radarr, or filesystem writers by themselves.
