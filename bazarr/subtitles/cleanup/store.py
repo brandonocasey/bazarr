@@ -5,8 +5,6 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
-from collections.abc import Callable, Sequence
-from sqlalchemy.engine import Row
 
 from .records import IndexedSubtitle, MediaMetadata, Operation
 
@@ -14,6 +12,8 @@ from app.database import (database, select, update, TableSubtitleCleanupOperatio
                           TableEpisodes, TableMoviesSubtitles, TableEpisodesSubtitles,
                           TableHistory, TableHistoryMovie, SUBTITLE_MAP_QUERY_BATCH_SIZE)
 from utilities.path_mappings import path_mappings
+from utilities.helper import get_subtitle_output_directories
+from utilities.subtitle_ownership import indexed_subtitle_owners
 
 
 class CleanupError(ValueError):
@@ -65,35 +65,8 @@ def indexed_subtitles(media_type: str, media_id: int) -> list[IndexedSubtitle]:
 
 
 def _assert_exclusive_owners(video_path: str, paths: set[str]) -> None:
-    sources = (
-        (TableEpisodes, TableEpisodesSubtitles, 'sonarrEpisodeId',
-         path_mappings.path_replace_reverse, path_mappings.path_replace),
-        (TableMovies, TableMoviesSubtitles, 'radarrId',
-         path_mappings.path_replace_reverse_movie, path_mappings.path_replace_movie),
-    )
-    for media, subtitles, identity, reverse, forward in sources:
-        aliases = set()
-        for path in paths:
-            aliases.update((path, reverse(path)))
-        values = sorted(aliases)
-        for offset in range(0, len(values), SUBTITLE_MAP_QUERY_BATCH_SIZE):
-            rows = database.execute(select(media.path).join(
-                subtitles, getattr(media, identity) == getattr(subtitles, identity))
-                .where(subtitles.path.in_(values[offset:offset + SUBTITLE_MAP_QUERY_BATCH_SIZE]))).all()
-            _verify_owner_rows(rows, video_path, forward)
-
-
-def _verify_owner_rows(rows: Sequence[Row[tuple[str]]], video_path: str, forward: Callable[[str], str]) -> None:
-    for row in rows:
-        if os.path.normcase(os.path.realpath(forward(row.path))) != os.path.normcase(video_path):
-            raise CleanupError('Subtitle is also indexed for another video; refusing shared-file cleanup', 409)
-
-
-def _subtitle_locations(video: Path, custom: Path | None) -> set[Path]:
-    locations = {video.parent}
-    if custom is not None:
-        locations.add(video.parent / custom)
-    return locations
+    if indexed_subtitle_owners(paths) - {os.path.normcase(video_path)}:
+        raise CleanupError('Subtitle is also indexed for another video; refusing shared-file cleanup', 409)
 
 
 def _video_paths() -> list[Path]:
@@ -105,7 +78,7 @@ def _video_paths() -> list[Path]:
     return videos
 
 
-def _index_video_owners(videos: list[Path], custom: Path | None) -> dict[Path, dict[str, set[str]]]:
+def _index_video_owners(videos: list[Path]) -> dict[Path, dict[str, set[str]]]:
     owners: dict[Path, dict[str, set[str]]] = {}
     directories: dict[Path, Path] = {}
     for video in videos:
@@ -113,7 +86,7 @@ def _index_video_owners(videos: list[Path], custom: Path | None) -> dict[Path, d
             directories[video.parent] = Path(os.path.normcase(os.path.realpath(video.parent)))
         parent = directories[video.parent]
         identity = os.path.normcase(str(parent / video.name))
-        for directory in _subtitle_locations(video, custom):
+        for directory in get_subtitle_output_directories(str(video)):
             if directory not in directories:
                 directories[directory] = Path(os.path.normcase(os.path.realpath(directory)))
             names = owners.setdefault(directories[directory], {})
@@ -153,16 +126,10 @@ def _scan_subtitle_locations(locations: set[Path]) -> tuple[list[Path], list[Pat
 
 
 def _sidecar_files(video: Path) -> list[Path]:
-    from app.config import settings
-    from utilities.helper import get_subtitle_destination_folder
-
-    destination = get_subtitle_destination_folder()
-    custom = Path(destination) if destination and settings.general.subfolder in ('absolute', 'relative') else None
-    if custom is not None and settings.general.subfolder == 'absolute':
-        custom = custom.absolute()
-    locations = {Path(os.path.normcase(os.path.realpath(path))) for path in _subtitle_locations(video, custom)}
+    locations = {Path(os.path.normcase(os.path.realpath(path)))
+                 for path in get_subtitle_output_directories(str(video))}
     videos, candidates = _scan_subtitle_locations(locations)
-    owners = _index_video_owners([video, *_video_paths(), *videos], custom)
+    owners = _index_video_owners([video, *_video_paths(), *videos])
     identity = os.path.normcase(str(video))
     found = []
     for path in candidates:
@@ -217,7 +184,7 @@ def create_operation(media_type: str, media_id: int, audio_stream_index: int | N
     database.add(TableSubtitleCleanupOperations(
         id=operation['id'], media_type=media_type, media_id=media_id,
         video_path=os.path.normcase(metadata['video_path']),
-        status='queued', payload=json.dumps(operation), created_at=datetime.now(timezone.utc),
+        status='queued', recovery_pending=False, payload=json.dumps(operation), created_at=datetime.now(timezone.utc),
     ))
     database.commit()
     return operation
@@ -231,6 +198,22 @@ def get_operation(operation_id: str) -> Operation:
     payload = json.loads(row.payload)
     payload['job_id'] = row.job_id
     return payload
+
+
+def get_operations(operation_ids: list[str]) -> dict[str, Operation | CleanupError]:
+    operations = {}
+    for offset in range(0, len(operation_ids), SUBTITLE_MAP_QUERY_BATCH_SIZE):
+        rows = database.execute(select(TableSubtitleCleanupOperations.id, TableSubtitleCleanupOperations.payload,
+                                       TableSubtitleCleanupOperations.job_id).where(
+            TableSubtitleCleanupOperations.id.in_(operation_ids[offset:offset + SUBTITLE_MAP_QUERY_BATCH_SIZE]))).all()
+        for row in rows:
+            try:
+                operation = json.loads(row.payload)
+                operation['job_id'] = row.job_id
+                operations[row.id] = operation
+            except (TypeError, ValueError) as error:
+                operations[row.id] = CleanupError(str(error), 409)
+    return operations
 
 
 def set_job_id(operation_id: str, job_id: int) -> Operation:
@@ -248,13 +231,16 @@ def list_operations(media_type: str, media_id: int) -> list[Operation]:
     return [json.loads(row.payload) for row in rows]
 
 
-def update_operation(operation: Operation, previous: tuple[str, ...] | None = None, *, reset_job: bool = False) -> Operation:
+def update_operation(operation: Operation, previous: tuple[str, ...] | None = None, *, reset_job: bool = False,
+                     recovery_pending: bool | None = None) -> Operation:
     statement = update(TableSubtitleCleanupOperations).where(TableSubtitleCleanupOperations.id == operation['id'])
     if previous is not None:
         statement = statement.where(TableSubtitleCleanupOperations.status.in_(previous))
     if reset_job:
         operation['job_id'] = None
         statement = statement.values(job_id=None)
+    if recovery_pending is not None:
+        statement = statement.values(recovery_pending=recovery_pending)
     result = database.execute(statement.values(status=operation['status'], payload=json.dumps(operation, allow_nan=False))
                               .returning(TableSubtitleCleanupOperations.id)).scalar_one_or_none()
     if result != operation['id']:
@@ -267,7 +253,7 @@ def update_operation(operation: Operation, previous: tuple[str, ...] | None = No
 def recovery_operations(video_path: str) -> list[Operation]:
     rows = database.execute(select(TableSubtitleCleanupOperations.payload)
                             .where(TableSubtitleCleanupOperations.video_path == os.path.normcase(video_path),
-                                   TableSubtitleCleanupOperations.status.in_(('applying', 'restoring', 'failed')))
+                                   TableSubtitleCleanupOperations.recovery_pending.is_(True))
                             .order_by(TableSubtitleCleanupOperations.created_at)).all()
     return [json.loads(row.payload) for row in rows]
 

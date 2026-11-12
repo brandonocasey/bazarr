@@ -3,13 +3,14 @@
 import hashlib
 import json
 import math
+import stat
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from collections.abc import Callable
 
 from . import media, store
 from .models import AnalysisOptions, ExternalSubtitle, JSONValue, MediaAnalysis, PreparedFile
-from .records import FileRecord, IndexedSubtitle, Operation, TrackGroup, analysis_record
+from .records import FileRecord, IndexedSubtitle, MediaMetadata, Operation, TrackGroup, analysis_record
 from .transactions import FileIdentity, fingerprint, verify_identity
 
 
@@ -76,13 +77,28 @@ def _analysis_payload(analysis: MediaAnalysis, download_scores: dict[str, float]
     return payload
 
 
-def analyze_operation(operation: Operation, workspace: Path, cancelled: Callable[[], bool]) -> Operation:
+@dataclass
+class AnalysisInputs:
+    metadata: MediaMetadata
+    subtitles: list[IndexedSubtitle]
+    identities: list[FileIdentity]
+
+
+def capture_inputs(operation: Operation) -> AnalysisInputs:
+    """Callers MUST capture writer state before collecting analysis inputs."""
     metadata = store.media_metadata(operation['media_type'], operation['media_id'])
     if metadata['video_path'] != operation['video_path']:
         raise store.CleanupError('Indexed video changed before analysis; create a fresh preview', 409)
     subtitles = store.indexed_subtitles(operation['media_type'], operation['media_id'])
     paths = input_paths(metadata['video_path'], subtitles)
     identities = [fingerprint(path) for path in paths]
+    return AnalysisInputs(metadata, subtitles, identities)
+
+
+def analyze_operation(operation: Operation, workspace: Path, cancelled: Callable[[], bool],
+                      inputs: AnalysisInputs) -> Operation:
+    metadata, subtitles, identities = inputs.metadata, inputs.subtitles, inputs.identities
+    paths = [identity.path for identity in identities]
     analysis = media.analyze_media(metadata['video_path'], [ExternalSubtitle(**item) for item in subtitles],
                                    str(workspace), AnalysisOptions(operation['audio_stream_index'], cancelled))
     if set(media.source_paths(analysis)) != set(paths):
@@ -101,12 +117,29 @@ def analyze_operation(operation: Operation, workspace: Path, cancelled: Callable
     return operation
 
 
-def validate_preview(operation: Operation) -> None:
+def _validate_preview_inventory(operation: Operation) -> None:
     metadata = store.media_metadata(operation['media_type'], operation['media_id'])
     if metadata['video_path'] != operation['video_path']:
         raise store.CleanupError('Indexed video changed since the cleanup preview', 409)
     if store.indexed_subtitles(operation['media_type'], operation['media_id']) != operation['indexed_subtitles']:
         raise store.CleanupError('Subtitle inventory changed since the cleanup preview', 409)
+
+
+def validate_analysis_preview(operation: Operation) -> None:
+    """Callers MUST hold the media lock and verify the captured writer generation."""
+    _validate_preview_inventory(operation)
+    for item in operation['files']:
+        info = Path(item['path']).lstat()
+        actual = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+                  stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
+        expected = (item['device'], item['inode'], item['size'], item['modified_ns'], item['changed_ns'],
+                    item['mode'], item['uid'], item['gid'])
+        if not stat.S_ISREG(info.st_mode) or actual != expected:
+            raise store.CleanupError(f'File changed since the cleanup preview: {item["path"]}', 409)
+
+
+def validate_preview(operation: Operation) -> None:
+    _validate_preview_inventory(operation)
     for item in operation['files']:
         verify_identity(FileIdentity(**item))
 

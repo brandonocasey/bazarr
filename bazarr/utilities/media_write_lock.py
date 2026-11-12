@@ -212,23 +212,9 @@ if hasattr(os, 'register_at_fork'):
 def subtitle_media_path(subtitle_path: str, video_path: str | None = None, *,
                         allow_unindexed: bool = False) -> str:
     """Resolve indexed ownership or validate fresh sidecars against the video and output location."""
-    from app.database import (database, select, TableEpisodes, TableEpisodesSubtitles,
-                              TableMovies, TableMoviesSubtitles)
-    from utilities.path_mappings import path_mappings
+    from utilities.subtitle_ownership import indexed_subtitle_owners
 
-    canonical_subtitle = _canonical_path(subtitle_path)
-    owners = set()
-    for media, subtitles, identifier, reverse, forward in (
-        (TableEpisodes, TableEpisodesSubtitles, 'sonarrEpisodeId',
-         path_mappings.path_replace_reverse, path_mappings.path_replace),
-        (TableMovies, TableMoviesSubtitles, 'radarrId',
-         path_mappings.path_replace_reverse_movie, path_mappings.path_replace_movie),
-    ):
-        candidates = (subtitle_path, reverse(subtitle_path), canonical_subtitle, reverse(canonical_subtitle))
-        rows = database.execute(
-            select(media.path).join(subtitles, getattr(media, identifier) == getattr(subtitles, identifier))
-            .where(subtitles.path.in_(candidates))).all()
-        owners.update(_canonical_path(forward(row.path)) for row in rows)
+    owners = indexed_subtitle_owners((subtitle_path,))
     if owners:
         if len(owners) != 1:
             raise OSError('Subtitle is indexed for multiple media files')
@@ -266,14 +252,6 @@ def _fresh_sidecar_owner(subtitle_path: str, video_path: str) -> str:
 
 
 def _output_locations(video_path: str) -> set[str]:
-    from app.config import settings
-    from utilities.helper import get_subtitle_destination_folder
+    from utilities.helper import get_subtitle_output_directories
 
-    directory = os.path.dirname(video_path)
-    destinations = {_canonical_path(directory)}
-    custom = get_subtitle_destination_folder()
-    if custom and settings.general.subfolder == 'absolute':
-        destinations.add(_canonical_path(custom))
-    elif custom and settings.general.subfolder == 'relative':
-        destinations.add(_canonical_path(os.path.join(directory, custom)))
-    return destinations
+    return {_canonical_path(str(path)) for path in get_subtitle_output_directories(video_path)}

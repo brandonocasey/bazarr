@@ -4,14 +4,17 @@ import hmac
 import logging
 import shutil
 import stat
+from collections.abc import Callable
 from concurrent.futures import CancelledError
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TypedDict
 from uuid import UUID
 
 from app.get_args import args
-from app.jobs_queue import jobs_queue, JobCanceled
-from utilities.media_write_lock import media_write_lock, register_media_write_guard
+from app.jobs_queue import jobs_queue, Job, JobCanceled
+from utilities.media_write_lock import media_write_lock, media_write_state, register_media_write_guard
 
 from . import media, planner, store, transactions
 from .models import MediaAnalysis
@@ -41,7 +44,7 @@ def _reject_enqueue(operation: Operation, function: str, message: str) -> None:
     previous = operation['status']
     status = {'run_analysis': 'failed', 'run_apply': 'ready', 'run_restore': 'complete'}[function]
     operation.update(status=status, error=message)
-    store.update_operation(operation, previous=(previous,))
+    store.update_operation(operation, previous=(previous,), recovery_pending=False)
 
 
 def _enqueue(operation: Operation, function: str) -> Operation:
@@ -76,17 +79,59 @@ def _has_active_job(operation: Operation) -> bool:
 
 
 def get_operation(operation_id: str) -> Operation:
-    operation = store.get_operation(operation_id)
+    return _revalidate_inactive_operation(store.get_operation(operation_id), _has_active_job)
+
+
+class OperationStatus(TypedDict):
+    id: str
+    operation: Operation | None
+    error: str | None
+
+
+def get_operations(operation_ids: list[str]) -> list[OperationStatus]:
+    identifiers = list(dict.fromkeys(operation_ids))
+    operations = store.get_operations(identifiers)
+    jobs = jobs_queue.snapshot_jobs()
+    is_active = partial(_snapshot_job_is_active, jobs=jobs)
+    return [_operation_status(identifier, operations.get(identifier), is_active) for identifier in identifiers]
+
+
+def _operation_status(identifier: str, operation: Operation | store.CleanupError | None,
+                      is_active: Callable[[Operation], bool]) -> OperationStatus:
+    try:
+        if isinstance(operation, store.CleanupError):
+            raise operation
+        if operation is None:
+            raise store.CleanupError('Cleanup operation not found', 404)
+        operation = _revalidate_inactive_operation(operation, is_active)
+        return {'id': identifier, 'operation': operation, 'error': None}
+    except Exception as error:
+        return {'id': identifier, 'operation': None, 'error': str(error)}
+
+
+def _snapshot_job_is_active(operation: Operation, jobs: dict[int, Job]) -> bool:
+    job_id = operation['job_id']
+    if job_id is None:
+        return True
+    job = jobs.get(job_id)
+    return job is not None and job.module == __name__ and job.kwargs.get('operation_id') == operation['id'] \
+        and job.status in ('pending', 'running')
+
+
+def _revalidate_inactive_operation(operation: Operation, is_active: Callable[[Operation], bool]) -> Operation:
     pending = ('queued', 'analyzing', 'applying', 'restoring')
-    if operation['status'] not in pending or _has_active_job(operation):
+    if operation['status'] not in pending or operation['job_id'] is None:
+        return operation
+    if is_active(operation):
         return operation
     with media_write_lock(operation['video_path']):
-        operation = store.get_operation(operation_id)
-        if operation['status'] in pending and not _has_active_job(operation):
-            operation['status'] = 'complete' if operation['status'] == 'restoring' else 'failed'
-            operation['error'] = 'Cleanup job was canceled or interrupted; create a fresh preview or confirm restoration again'
-            store.update_operation(operation)
-    return operation
+        current = store.get_operation(operation['id'])
+        unchanged = current['status'] == operation['status'] and current['job_id'] == operation['job_id']
+        if unchanged and not is_active(current):
+            current['status'] = 'complete' if current['status'] == 'restoring' else 'failed'
+            current['error'] = 'Cleanup job was canceled or interrupted; create a fresh preview or confirm restoration again'
+            store.update_operation(current)
+        return current
 
 
 def _check_token(operation: Operation, token: object) -> None:
@@ -103,7 +148,7 @@ def apply(operation_id: str, token: object, keepers: dict[str, str]) -> Operatio
         raise store.CleanupError('Only a ready preview can be applied once', 409)
     operation['selected_keepers'] = planner.validate_keepers(operation, keepers)
     operation.update(status='applying', error=None, backup_path=str(_directory(operation)))
-    store.update_operation(operation, previous=('ready',), reset_job=True)
+    store.update_operation(operation, previous=('ready',), reset_job=True, recovery_pending=True)
     return _enqueue(operation, 'run_apply')
 
 
@@ -113,7 +158,7 @@ def restore(operation_id: str, token: object) -> Operation:
     if operation['status'] != 'complete':
         raise store.CleanupError('Only a completed cleanup can be restored', 409)
     operation.update(status='restoring', error=None)
-    store.update_operation(operation, previous=('complete',), reset_job=True)
+    store.update_operation(operation, previous=('complete',), reset_job=True, recovery_pending=True)
     return _enqueue(operation, 'run_restore')
 
 
@@ -122,8 +167,18 @@ def run_analysis(operation_id: str, job_id: int | None = None) -> None:
     operation['status'] = 'analyzing'
     store.update_operation(operation, previous=('queued',))
     try:
-        with media_write_lock(operation['video_path'], job_id=job_id):
-            planner.analyze_operation(operation, _workspace(operation), lambda: _cancelled(job_id))
+        if store.recovery_operations(operation['video_path']):
+            with media_write_lock(operation['video_path'], job_id=job_id):
+                pass
+        writer_state = media_write_state(operation['video_path'])
+        if writer_state.active:
+            raise store.CleanupError('Media writer is active; create a fresh cleanup preview', 409)
+        inputs = planner.capture_inputs(operation)
+        planner.analyze_operation(operation, _workspace(operation), lambda: _cancelled(job_id), inputs)
+        with media_write_lock(operation['video_path'], job_id=job_id) as previous_writer:
+            if previous_writer != writer_state:
+                raise store.CleanupError('Media writer changed during cleanup analysis; create a fresh preview', 409)
+            planner.validate_analysis_preview(operation)
             if _cancelled(job_id):
                 raise CancelledError('Cleanup analysis was canceled')
             store.update_operation(operation, previous=('analyzing',))
@@ -181,6 +236,8 @@ def run_apply(operation_id: str, job_id: int | None = None) -> None:
             operation = store.get_operation(operation_id)
             if operation['status'] != 'applying':
                 return
+            # Staging MUST rearm recovery after the guard clears an empty claim.
+            store.update_operation(operation, previous=('applying',), recovery_pending=True)
             journal = _apply_files(operation, job_id)
             _finish(operation, journal)
     except Exception as error:
@@ -196,7 +253,7 @@ def run_restore(operation_id: str, job_id: int | None = None) -> None:
                 return
             if _cancelled(job_id):
                 operation['status'] = 'complete'
-                store.update_operation(operation)
+                store.update_operation(operation, recovery_pending=False)
                 return
             journal = transactions.restore_transaction(_directory(operation))
             _finish(operation, journal)
@@ -220,6 +277,7 @@ def _finish(operation: Operation, journal: Journal) -> None:
     store.update_operation(operation)
     try:
         store.refresh_inventory(operation)
+        store.update_operation(operation, recovery_pending=False)
     except Exception as error:
         operation['error'] = f'Files verified, but inventory refresh failed: {error}'
         store.update_operation(operation)
@@ -247,7 +305,7 @@ def recover_for_media(video_path: str) -> bool:
         journal = transactions.read_journal(directory)
         if journal is None:
             _cleanup_staging(operation)
-            store.update_operation(operation)
+            store.update_operation(operation, recovery_pending=False)
             continue
         if journal['phase'] == 'complete' and operation['status'] == 'restoring':
             continue
@@ -259,7 +317,7 @@ def recover_for_media(video_path: str) -> bool:
             _finish(operation, journal)
         elif journal['phase'] == 'rolled_back':
             operation.update(status='failed', error='Interrupted cleanup was rolled back; create a fresh preview')
-            store.update_operation(operation)
+            store.update_operation(operation, recovery_pending=False)
     return recovered
 
 
@@ -277,8 +335,9 @@ def _recover_operation(operation: Operation) -> None:
 def recover_interrupted_operations() -> None:
     from app.database import database, select, TableSubtitleCleanupOperations
     rows = database.execute(select(TableSubtitleCleanupOperations.id)
-                            .where(TableSubtitleCleanupOperations.status.in_(
-                                ('queued', 'analyzing', 'applying', 'restoring', 'failed')))).all()
+                            .where(TableSubtitleCleanupOperations.recovery_pending.is_(True) |
+                                   TableSubtitleCleanupOperations.status.in_(
+                                       ('queued', 'analyzing', 'applying', 'restoring')))).all()
     for row in rows:
         operation = store.get_operation(row.id)
         try:

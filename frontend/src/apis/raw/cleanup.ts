@@ -69,6 +69,12 @@ export interface CleanupOperation extends CleanupMedia {
   created_at: string;
 }
 
+export interface CleanupOperationStatus {
+  id: string;
+  operation: CleanupOperation | null;
+  error: string | null;
+}
+
 export const cleanupMediaKey = (media: CleanupMedia) =>
   `${media.media_type}:${media.media_id}`;
 
@@ -95,6 +101,26 @@ const cleanup = {
       `${prefix}/${encodeURIComponent(id)}`,
     );
     return response.data;
+  },
+  async status(ids: string[], signal: AbortSignal) {
+    const response = await client.axios.post<{
+      data: CleanupOperationStatus[];
+    }>(`${prefix}/status`, { operation_ids: ids }, { signal });
+    const statuses = response.data?.data;
+    if (
+      !Array.isArray(statuses) ||
+      statuses.some(
+        (entry) =>
+          !entry ||
+          typeof entry.id !== "string" ||
+          (entry.error !== null && typeof entry.error !== "string") ||
+          (entry.operation !== null &&
+            (typeof entry.operation !== "object" ||
+              typeof entry.operation.id !== "string")),
+      )
+    )
+      throw new Error("Invalid cleanup status response. Retry the operation.");
+    return statuses;
   },
   async apply(
     id: string,

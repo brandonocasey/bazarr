@@ -142,13 +142,17 @@ const operation = (media = movie): CleanupOperation => ({
   error: null,
   created_at: "2026-11-12T12:00:00Z",
 });
+const statusResponse = (operation: CleanupOperation) =>
+  HttpResponse.json({
+    data: [{ id: operation.id, operation, error: null }],
+  });
 const register = (preview = operation()) => {
   server.use(
     http.get("/api/subtitles/cleanup", () => HttpResponse.json({ data: [] })),
     http.post("/api/subtitles/cleanup/preview", () =>
       HttpResponse.json(preview, { status: 202 }),
     ),
-    http.get("/api/subtitles/cleanup/:id", () => HttpResponse.json(preview)),
+    http.post("/api/subtitles/cleanup/status", () => statusResponse(preview)),
   );
 };
 const previewAndChoose = async () => {
@@ -484,7 +488,7 @@ describe("Subtitle cleanup", () => {
     register({ ...operation(), status: "queued", analysis: null, groups: [] });
     const gets = vi.fn();
     server.use(
-      http.get("/api/subtitles/cleanup/:id", () => {
+      http.post("/api/subtitles/cleanup/status", () => {
         gets();
         return HttpResponse.json(
           { error: "Analysis worker unavailable" },
@@ -524,6 +528,8 @@ describe("Subtitle cleanup", () => {
         restored_files: [],
       },
     };
+    if (!complete.result) throw new Error("Fixture result missing");
+    const restoredResult = complete.result;
     register(complete);
     const restoring = { current: false };
     server.use(
@@ -539,14 +545,14 @@ describe("Subtitle cleanup", () => {
           { status: 202 },
         );
       }),
-      http.get("/api/subtitles/cleanup/:id", () =>
-        HttpResponse.json(
+      http.post("/api/subtitles/cleanup/status", () =>
+        statusResponse(
           restoring.current
             ? {
                 ...complete,
                 status: "restored",
                 result: {
-                  ...complete.result,
+                  ...restoredResult,
                   restored_files: ["/media/video.mkv"],
                 },
               }
@@ -736,15 +742,17 @@ describe("Subtitle cleanup", () => {
       screen.getByRole("button", { name: "Apply confirmed cleanup" }),
     ).toBeEnabled();
     server.use(
-      http.get("/api/subtitles/cleanup/:id", () =>
+      http.post("/api/subtitles/cleanup/status", () =>
         HttpResponse.json(
           { error: "Preview could not be revalidated" },
           { status: 503 },
         ),
       ),
     );
-    await queryClient.invalidateQueries({
-      queryKey: [QueryKeys.Subtitles, "cleanup", "movie:7", "movie-operation"],
+    await act(async () => {
+      await queryClient.invalidateQueries({
+        queryKey: [QueryKeys.Subtitles, "cleanup", "status"],
+      });
     });
     await screen.findAllByText(/Preview could not be revalidated/);
     expect(
@@ -772,7 +780,7 @@ describe("Subtitle cleanup", () => {
       pending.finish = resolve;
     });
     server.use(
-      http.get("/api/subtitles/cleanup/:id", async () => {
+      http.post("/api/subtitles/cleanup/status", async () => {
         await response;
         return HttpResponse.json(
           { error: "Preview could not be revalidated" },
@@ -782,12 +790,7 @@ describe("Subtitle cleanup", () => {
     );
     await act(async () => {
       pending.refresh = queryClient.invalidateQueries({
-        queryKey: [
-          QueryKeys.Subtitles,
-          "cleanup",
-          "movie:7",
-          "movie-operation",
-        ],
+        queryKey: [QueryKeys.Subtitles, "cleanup", "status"],
       });
     });
     await waitFor(() => expect(confirmation).not.toBeChecked());
@@ -802,8 +805,8 @@ describe("Subtitle cleanup", () => {
     await screen.findAllByText(/Preview could not be revalidated/);
     expect.soft(confirmation).not.toBeChecked();
     server.use(
-      http.get("/api/subtitles/cleanup/:id", () =>
-        HttpResponse.json(operation()),
+      http.post("/api/subtitles/cleanup/status", () =>
+        statusResponse(operation()),
       ),
     );
     await user.click(screen.getByRole("button", { name: "Retry operation" }));
@@ -855,10 +858,18 @@ describe("Subtitle cleanup", () => {
           const body = (await request.json()) as CleanupMedia;
           return HttpResponse.json(resultFor(body), { status: 202 });
         }),
-        http.get("/api/subtitles/cleanup/:id", ({ params }) => {
-          const item = media.find((item) => keyOf(item) === params.id);
-          if (!item) throw new Error("Unknown fixture media");
-          return HttpResponse.json(resultFor(item));
+        http.post("/api/subtitles/cleanup/status", async ({ request }) => {
+          const { operation_ids } = (await request.json()) as {
+            operation_ids: string[];
+          };
+          const items = new Map(media.map((item) => [keyOf(item), item]));
+          return HttpResponse.json({
+            data: operation_ids.map((id) => {
+              const item = items.get(id);
+              if (!item) throw new Error("Unknown fixture media");
+              return { id, operation: resultFor(item), error: null };
+            }),
+          });
         }),
       );
       customRender(<SubtitleCleanupView media={media} />);
@@ -874,7 +885,7 @@ describe("Subtitle cleanup", () => {
         completed.add(key);
         await act(async () => {
           await queryClient.invalidateQueries({
-            queryKey: [QueryKeys.Subtitles, "cleanup", key, key],
+            queryKey: [QueryKeys.Subtitles, "cleanup", "status"],
           });
         });
         await screen.findByText(`Operation ${key}: complete`);

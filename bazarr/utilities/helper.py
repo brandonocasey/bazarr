@@ -4,6 +4,7 @@ import os
 import logging
 import hashlib
 import hmac
+from pathlib import Path
 from flask import Request
 
 from charset_normalizer import detect
@@ -69,6 +70,27 @@ def get_subtitle_destination_folder() -> str | None:
     return fld_custom
 
 
+def get_subtitle_target_path(file_path: str) -> str | None:
+    """Resolve the configured subtitle target without creating its directory."""
+    custom = get_subtitle_destination_folder()
+    if not custom:
+        return None
+    if settings.general.subfolder == 'absolute':
+        return force_unicode(custom)
+    if settings.general.subfolder == 'relative':
+        return force_unicode(os.path.join(os.path.dirname(file_path), custom))
+    return None
+
+
+def get_subtitle_output_directories(file_path: str) -> set[Path]:
+    """Return subtitle locations without creating directories."""
+    directories = {Path(file_path).parent}
+    target = get_subtitle_target_path(file_path)
+    if target is not None:
+        directories.add(Path(target))
+    return directories
+
+
 def get_target_folder(file_path: str) -> str | None:
     """
     Determine the directory in which subtitles for the given media file should
@@ -89,35 +111,13 @@ def get_target_folder(file_path: str) -> str | None:
         dedicated subfolder applies, the subfolder mode is unknown, or the
         directory could not be created.
     """
-    subfolder = settings.general.subfolder
-    fld_custom = str(settings.general.subfolder_custom).strip() \
-        if settings.general.subfolder_custom else None
-
-    if subfolder != "current" and fld_custom:
-        # specific subFolder requested, create it if it doesn't exist
-        fld_base = os.path.split(file_path)[0]
-
-        if subfolder == "absolute":
-            # absolute folder
-            fld = fld_custom
-        elif subfolder == "relative":
-            fld = os.path.join(fld_base, fld_custom)
-        else:
-            fld = None
-
-        if fld is None:
+    fld = get_subtitle_target_path(file_path)
+    if fld is not None and not os.path.isdir(fld):
+        try:
+            os.makedirs(fld)
+        except Exception:
+            logging.error(f'BAZARR is unable to create directory to save subtitles: {fld}')
             return None
-        fld = force_unicode(fld)
-
-        if not os.path.isdir(fld):
-            try:
-                os.makedirs(fld)
-            except Exception:
-                logging.error(f'BAZARR is unable to create directory to save subtitles: {fld}')
-                fld = None
-    else:
-        fld = None
-
     return fld
 
 

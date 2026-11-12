@@ -130,7 +130,7 @@ def test_completed_journal_recovery_invalidates_unchanged_file_selection(library
     _, _, _, video, aligned, lower = library
     completed = _apply(library, _preview(library))
     completed['status'] = 'failed'
-    store.update_operation(completed)
+    store.update_operation(completed, recovery_pending=True)
     before = _sha(video)
     selection = media_write_state(str(video))
     with media_write_lock(str(video)) as recovered:
@@ -159,7 +159,7 @@ def test_rolled_back_journal_allows_fresh_extraction_retries(library, monkeypatc
                                      [transactions.fingerprint(str(lower))], cancel)
     assert transactions.read_journal(directory)['phase'] == 'rolled_back'
     operation['status'] = 'failed'
-    store.update_operation(operation)
+    store.update_operation(operation, recovery_pending=True)
     track = TableMoviesSubtitles(radarrId=media_id, embedded_track_id=2, language='en', forced=False, hi=False)
     database.add(track)
     database.commit()
