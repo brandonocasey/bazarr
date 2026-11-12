@@ -48,6 +48,33 @@ import { RouterNames } from "@/Router/RouterNames";
 import { useLanguageProfileBy } from "@/utilities/languages";
 import Table from "./table";
 
+const EpisodeCleanupButton: FunctionComponent<{
+  episodes: Item.Episode[] | undefined;
+  seriesTitle: string | undefined;
+  hasTask: boolean;
+}> = ({ episodes, seriesTitle, hasTask }) => {
+  const modals = useModals();
+
+  return (
+    <Toolbox.Button
+      icon={faBriefcase}
+      disabled={!episodes?.length || hasTask}
+      onClick={() => {
+        if (episodes)
+          modals.openContextModal(SubtitleCleanupModal, {
+            media: episodes.map((episode): CleanupMedia => ({
+              media_type: "series",
+              media_id: episode.sonarrEpisodeId,
+              title: `${seriesTitle ?? ""} - ${episode.title}`,
+            })),
+          });
+      }}
+    >
+      Cleanup subtitles
+    </Toolbox.Button>
+  );
+};
+
 const SeriesEpisodesView: FunctionComponent = () => {
   const params = useParams();
   const id = Number.parseInt(params.id as string);
@@ -138,22 +165,11 @@ const SeriesEpisodesView: FunctionComponent = () => {
         ></UploadDropzone>
         <Toolbox>
           <Group gap="xs">
-            <Toolbox.Button
-              icon={faBriefcase}
-              disabled={!episodes?.length || hasTask}
-              onClick={() => {
-                if (episodes)
-                  modals.openContextModal(SubtitleCleanupModal, {
-                    media: episodes.map((episode): CleanupMedia => ({
-                      media_type: "series",
-                      media_id: episode.sonarrEpisodeId,
-                      title: `${series?.title ?? ""} - ${episode.title}`,
-                    })),
-                  });
-              }}
-            >
-              Cleanup subtitles
-            </Toolbox.Button>
+            <EpisodeCleanupButton
+              episodes={episodes}
+              seriesTitle={series?.title}
+              hasTask={hasTask}
+            />
             <Toolbox.Button
               icon={faSync}
               disabled={!available || hasTask}

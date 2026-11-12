@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 
+from dataclasses import dataclass
 from threading import Event, Thread
 
 from utilities.media_write_lock import media_write_lock, subtitle_media_path
@@ -22,6 +23,17 @@ from app.get_args import args
 from app.jobs_queue import jobs_queue, JobCanceled
 
 WORKER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'subsync_worker.py')
+
+
+@dataclass
+class _SyncContext:
+    language: str
+    hearing_impaired: bool
+    forced: bool
+    sonarr_series_id: int | None
+    sonarr_episode_id: int | None
+    radarr_id: int | None
+    force_sync: bool
 
 
 class SubSyncer:
@@ -196,11 +208,55 @@ class SubSyncer:
             raise RuntimeError(f'ffsubsync worker exited with code {returncode} without returning a result')
         return result
 
+    def _reference_stream_arguments(self, reference, context):
+        arguments = []
+        logging.debug(f"BAZARR subsync: settings — force_audio={settings.subsync.force_audio} "
+                     f"use_original_language={settings.subsync.use_original_language} "
+                     f"auto_use_original_language={settings.subsync.auto_use_original_language} "
+                     f"force_sync={context.force_sync}")
+        if reference and isinstance(reference, str) and len(reference) == 3 and reference[:2] in ['a:', 's:']:
+            # audio or subtitles track id provided
+            arguments.append('--reference-stream')
+            arguments.append(reference)
+        elif settings.subsync.force_audio and not context.force_sync:
+            # auto-sync with force_audio: use a:0, optionally overridden by original-language match
+            stream_spec = 'a:0'
+            if settings.subsync.use_original_language:
+                matched = self._audio_stream_for_original_language(
+                    sonarr_series_id=context.sonarr_series_id,
+                    sonarr_episode_id=context.sonarr_episode_id,
+                    radarr_id=context.radarr_id,
+                )
+                if matched:
+                    stream_spec = matched
+            logging.debug(f"BAZARR subsync: using --reference-stream {stream_spec}")
+            arguments.append('--reference-stream')
+            arguments.append(stream_spec)
+        elif settings.subsync.use_original_language or settings.subsync.auto_use_original_language:
+            # original-language preference active. Applies to both manual and
+            # automatic sync; does NOT change Bazarr's existing force_audio
+            # behavior (which only fires during auto-sync).
+            matched = self._audio_stream_for_original_language(
+                sonarr_series_id=context.sonarr_series_id,
+                sonarr_episode_id=context.sonarr_episode_id,
+                radarr_id=context.radarr_id,
+            )
+            if matched:
+                logging.debug(f"BAZARR subsync: using --reference-stream {matched}")
+                arguments.append('--reference-stream')
+                arguments.append(matched)
+            else:
+                logging.debug("BAZARR subsync: no original-language match; using ffsubsync default reference")
+        return arguments
+
     def sync(self, video_path, srt_path, srt_lang, hi, forced,
              max_offset_seconds, no_fix_framerate, gss, reference=None, sonarr_series_id=None, sonarr_episode_id=None,
              radarr_id=None, job_id=None, force_sync=False, quality_min_score=None, quality_max_offset_seconds=None,
              quality_max_framerate_deviation=None):
         with media_write_lock(subtitle_media_path(srt_path, video_path, allow_unindexed=True), job_id=job_id):
+            context = _SyncContext(language=srt_lang, hearing_impaired=hi, forced=forced,
+                                   sonarr_series_id=sonarr_series_id, sonarr_episode_id=sonarr_episode_id,
+                                   radarr_id=radarr_id, force_sync=force_sync)
             self.reference = video_path
             self.srtin = srt_path
             self.sync_result = None
@@ -251,43 +307,7 @@ class SubSyncer:
                 if gss:
                     unparsed_args.append('--gss')
 
-                logging.debug(f"BAZARR subsync: settings — force_audio={settings.subsync.force_audio} "
-                             f"use_original_language={settings.subsync.use_original_language} "
-                             f"auto_use_original_language={settings.subsync.auto_use_original_language} "
-                             f"force_sync={force_sync}")
-                if reference and isinstance(reference, str) and len(reference) == 3 and reference[:2] in ['a:', 's:']:
-                    # audio or subtitles track id provided
-                    unparsed_args.append('--reference-stream')
-                    unparsed_args.append(reference)
-                elif settings.subsync.force_audio and not force_sync:
-                    # auto-sync with force_audio: use a:0, optionally overridden by original-language match
-                    stream_spec = 'a:0'
-                    if settings.subsync.use_original_language:
-                        matched = self._audio_stream_for_original_language(
-                            sonarr_series_id=sonarr_series_id,
-                            sonarr_episode_id=sonarr_episode_id,
-                            radarr_id=radarr_id,
-                        )
-                        if matched:
-                            stream_spec = matched
-                    logging.debug(f"BAZARR subsync: using --reference-stream {stream_spec}")
-                    unparsed_args.append('--reference-stream')
-                    unparsed_args.append(stream_spec)
-                elif settings.subsync.use_original_language or settings.subsync.auto_use_original_language:
-                    # original-language preference active. Applies to both manual and
-                    # automatic sync; does NOT change Bazarr's existing force_audio
-                    # behavior (which only fires during auto-sync).
-                    matched = self._audio_stream_for_original_language(
-                        sonarr_series_id=sonarr_series_id,
-                        sonarr_episode_id=sonarr_episode_id,
-                        radarr_id=radarr_id,
-                    )
-                    if matched:
-                        logging.debug(f"BAZARR subsync: using --reference-stream {matched}")
-                        unparsed_args.append('--reference-stream')
-                        unparsed_args.append(matched)
-                    else:
-                        logging.debug("BAZARR subsync: no original-language match; using ffsubsync default reference")
+                unparsed_args.extend(self._reference_stream_arguments(reference, context))
 
                 if settings.subsync.debug:
                     unparsed_args.append('--make-test-case')
@@ -309,47 +329,50 @@ class SubSyncer:
             except Exception:
                 logging.exception(
                     f'BAZARR an exception occurs during the synchronization process for this subtitle file: {self.srtin}')
+                return
+            return self._apply_sync_result(result, context)
+
+    def _apply_sync_result(self, result, context):
+        if settings.subsync.debug:
+            return result
+        if not result.get('sync_was_successful'):
+            # ffsubsync rejected the alignment (low quality or anti-correlated score): keep the original subtitles
+            if os.path.isfile(self.srtout):
+                os.remove(self.srtout)
+            logging.warning(f'BAZARR subtitles synchronization was rejected, original subtitles left untouched: '
+                            f'{self.srtin}')
+            return result
+        if not os.path.isfile(self.srtout):
+            logging.error(f'BAZARR unable to sync subtitles: {self.srtin}')
+            return result
+        if not settings.subsync.debug:
+            os.remove(self.srtin)
+            os.rename(self.srtout, self.srtin)
+
+            offset_seconds = result['offset_seconds'] or 0
+            framerate_scale_factor = result['framerate_scale_factor'] or 0
+            message = (f"{language_from_alpha2(context.language)} subtitles synchronization ended with an offset of "
+                       f"{offset_seconds} seconds and a framerate scale factor of "
+                       f"{f'{framerate_scale_factor:.2f}'}.")
+
+            if context.sonarr_series_id:
+                prr = path_mappings.path_replace_reverse
             else:
-                if settings.subsync.debug:
-                    return result
-                if not result.get('sync_was_successful'):
-                    # ffsubsync rejected the alignment (low quality or anti-correlated score): keep the original subtitles
-                    if os.path.isfile(self.srtout):
-                        os.remove(self.srtout)
-                    logging.warning(f'BAZARR subtitles synchronization was rejected, original subtitles left untouched: '
-                                    f'{self.srtin}')
-                elif os.path.isfile(self.srtout):
-                    if not settings.subsync.debug:
-                        os.remove(self.srtin)
-                        os.rename(self.srtout, self.srtin)
+                prr = path_mappings.path_replace_reverse_movie
 
-                        offset_seconds = result['offset_seconds'] or 0
-                        framerate_scale_factor = result['framerate_scale_factor'] or 0
-                        message = (f"{language_from_alpha2(srt_lang)} subtitles synchronization ended with an offset of "
-                                   f"{offset_seconds} seconds and a framerate scale factor of "
-                                   f"{f'{framerate_scale_factor:.2f}'}.")
+            result = ProcessSubtitlesResult(message=message,
+                                            reversed_path=prr(self.reference),
+                                            downloaded_language_code2=context.language,
+                                            downloaded_provider=None,
+                                            score=None,
+                                            forced=context.forced,
+                                            subtitle_id=None,
+                                            reversed_subtitles_path=prr(self.srtin),
+                                            hearing_impaired=context.hearing_impaired)
 
-                        if sonarr_series_id:
-                            prr = path_mappings.path_replace_reverse
-                        else:
-                            prr = path_mappings.path_replace_reverse_movie
-
-                        result = ProcessSubtitlesResult(message=message,
-                                                        reversed_path=prr(self.reference),
-                                                        downloaded_language_code2=srt_lang,
-                                                        downloaded_provider=None,
-                                                        score=None,
-                                                        forced=forced,
-                                                        subtitle_id=None,
-                                                        reversed_subtitles_path=prr(self.srtin),
-                                                        hearing_impaired=hi)
-
-                        if sonarr_episode_id:
-                            history_log(action=5, sonarr_series_id=sonarr_series_id, sonarr_episode_id=sonarr_episode_id,
-                                        result=result)
-                        else:
-                            history_log_movie(action=5, radarr_id=radarr_id, result=result)
-                else:
-                    logging.error(f'BAZARR unable to sync subtitles: {self.srtin}')
-
-                return result
+            if context.sonarr_episode_id:
+                history_log(action=5, sonarr_series_id=context.sonarr_series_id, sonarr_episode_id=context.sonarr_episode_id,
+                            result=result)
+            else:
+                history_log_movie(action=5, radarr_id=context.radarr_id, result=result)
+        return result

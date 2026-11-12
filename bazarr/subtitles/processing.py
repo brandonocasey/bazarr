@@ -177,7 +177,7 @@ def process_subtitle(subtitle, media_type, audio_language, path, max_score, is_u
             _notify()
 
     if settings.subsync.use_subsync and sync_checker(subtitle) is True:
-        # Post-processing and notifications must see the file after sync finishes.
+        # Post-processing and notifications MUST see the file after sync finishes.
         from .sync import sync_subtitles
         sync_subtitles(video_path=path, srt_path=downloaded_path,
                        forced=language_forced,

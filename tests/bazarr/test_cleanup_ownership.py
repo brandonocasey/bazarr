@@ -9,6 +9,7 @@ from tests.bazarr import test_cleanup_api as api_fixtures
 from utilities.path_mappings import path_mappings
 
 
+authenticated_client = api_fixtures.authenticated_client
 library = api_fixtures.library
 media = api_fixtures.media
 

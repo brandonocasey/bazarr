@@ -50,7 +50,7 @@ def sync_subtitles(video_path,
                                quality_max_framerate_deviation=quality_max_framerate_deviation)
     finally:
         # Required callbacks may wait for another writer even after sync cancellation.
-        # Keep that wait outside the sync concurrency limit.
+        # That wait MUST stay outside the sync concurrency limit.
         queue_post_sync_callback(callback, srt_path)
 
 

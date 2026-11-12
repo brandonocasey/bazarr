@@ -106,15 +106,19 @@ def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[
             lock.file = file
             lock.depth = 1
             try:
-                with _registry_mutex:
-                    guards = tuple(_guards)
-                for guard in guards:
-                    guard(canonical)
-                _raise_if_canceled(job_id)
+                _run_write_guards(canonical, job_id)
                 yield
             finally:
                 lock.depth = 0
                 lock.file = None
+
+
+def _run_write_guards(canonical: str, job_id: int | None) -> None:
+    with _registry_mutex:
+        guards = tuple(_guards)
+    for guard in guards:
+        guard(canonical)
+    _raise_if_canceled(job_id)
 
 
 def _after_fork() -> None:

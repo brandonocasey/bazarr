@@ -41,7 +41,12 @@ def _write_signal_subtitle(path, activity):
 
 
 @pytest.fixture
-def library(api_client, api_key, tmp_path, monkeypatch, media):
+def authenticated_client(api_client, api_key):
+    return api_client, {'X-API-KEY': api_key}
+
+
+@pytest.fixture
+def library(authenticated_client, tmp_path, monkeypatch, media):
     from app.config import settings
     from app.get_args import args
 
@@ -79,7 +84,8 @@ def library(api_client, api_key, tmp_path, monkeypatch, media):
                           score_out_of=180, video_path=str(video), subtitles_path=str(lower)),
     ])
     database.commit()
-    yield api_client, {'X-API-KEY': api_key}, media_id, video, aligned, lower
+    client, headers = authenticated_client
+    yield client, headers, media_id, video, aligned, lower
     operation_ids = database.execute(select(TableSubtitleCleanupOperations.id)
                                      .where(TableSubtitleCleanupOperations.media_id == media_id)).scalars().all()
     jobs_queue.jobs_pending_queue = type(jobs_queue.jobs_pending_queue)(

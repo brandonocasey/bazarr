@@ -191,12 +191,13 @@ def test_selected_audio_is_shared_and_silent_reference_remains_unrankable(media,
         analyze_media(str(dual), external, str(tmp_path / 'invalid'), AnalysisOptions(audio_stream_index=0))
 
 
-@pytest.mark.parametrize('damage,reason', [('metadata', 'metadata'), ('attachment', 'lost or added'), ('timing', 'presentation timestamps'), ('edition', 'Matroska tags or chapter editions'), ('segment', 'segment identities')])
-def test_prepare_rejects_successful_but_lossy_tool_output(media, tmp_path, monkeypatch, damage, reason):
+@pytest.mark.parametrize('damage_case', [('metadata', 'metadata'), ('attachment', 'lost or added'), ('timing', 'presentation timestamps'), ('edition', 'Matroska tags or chapter editions'), ('segment', 'segment identities')])
+def test_prepare_rejects_successful_but_lossy_tool_output(media, tmp_path, monkeypatch, damage_case):
     import os
     import shutil
     import sys
 
+    damage, reason = damage_case
     video = media[0]
     before = digest(video)
     analysis = analyze_media(str(video), [], str(tmp_path / 'analysis'))

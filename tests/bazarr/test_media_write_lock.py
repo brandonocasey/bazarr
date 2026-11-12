@@ -90,6 +90,18 @@ def test_guard_failure_and_writer_exception_release_lock(guard, tmp_path):
     assert len(attempts) == 3
 
 
+def _wait_until(predicate):
+    for _ in range(500):
+        if predicate():
+            break
+        threading.Event().wait(0.01)
+
+
+def _assert_future_raises(future, exception, timeout):
+    with pytest.raises(exception):
+        future.result(timeout=timeout)
+
+
 def test_simultaneous_processes_serialize_actual_postprocessor(guard, tmp_path):
     from app.get_args import args
 
@@ -115,10 +127,7 @@ postprocessing([sys.executable, '-c', 'from pathlib import Path; import sys; p=P
                                    env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             # The child announces immediately before the real writer entry point.
-            for _ in range(500):
-                if started.exists():
-                    break
-                threading.Event().wait(0.01)
+            _wait_until(lambda: started.exists())
             assert started.exists(), 'child did not reach writer'
             with pytest.raises(subprocess.TimeoutExpired):
                 process.wait(timeout=0.25)
@@ -160,16 +169,21 @@ def test_fresh_sidecars_require_indexed_video_and_configured_location(media, mon
             coordination.subtitle_media_path(str(decoy), str(video), allow_unindexed=True)
 
 
-@pytest.mark.parametrize('route', ['mods', 'sync', 'translation', 'delete', 'extraction'])
-def test_real_writer_stops_before_first_effect_when_recovery_fails(route, guard, media, memory_session, monkeypatch):
-    video, subtitle, embedded_id = media
-    before = subtitle.read_bytes()
-
+@pytest.fixture
+def blocked_media(media, guard):
+    video, _, _ = media
     def recover(path):
         assert path == str(video)
         raise RecoveryRequired('recover journal before mutation')
 
     guard(recover)
+    return media
+
+
+@pytest.mark.parametrize('route', ['mods', 'sync', 'translation', 'delete', 'extraction'])
+def test_real_writer_stops_before_first_effect_when_recovery_fails(route, blocked_media, memory_session, monkeypatch):
+    video, subtitle, embedded_id = blocked_media
+    before = subtitle.read_bytes()
     with pytest.raises(RecoveryRequired):
         if route == 'mods':
             from subtitles.tools.mods import subtitles_apply_mods
@@ -301,10 +315,7 @@ with media_write_lock(sys.argv[2]):
     process = subprocess.Popen([sys.executable, '-c', script, args.config_dir, video, str(ready)],
                                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        for _ in range(500):
-            if ready.exists():
-                break
-            threading.Event().wait(0.01)
+        _wait_until(lambda: ready.exists())
         assert ready.exists(), 'child did not acquire lock'
     finally:
         process.kill()
@@ -425,10 +436,7 @@ with media_write_lock(sys.argv[2]):
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                env=environment, text=True)
     try:
-        for _ in range(500):
-            if ready.exists():
-                break
-            threading.Event().wait(0.01)
+        _wait_until(lambda: ready.exists())
         assert ready.exists(), 'child did not acquire file lock'
 
         def wait_for_writer():
@@ -465,8 +473,7 @@ def test_canceled_sync_leaves_writer_wait_without_releasing_other_writer(media, 
             assert started.wait(5)
             canceled.set()
             try:
-                with pytest.raises(JobCanceled):
-                    future.result(timeout=2)
+                _assert_future_raises(future, JobCanceled, timeout=2)
             finally:
                 canceled.set()
 
@@ -525,50 +532,74 @@ def test_mapped_subtitle_and_video_use_local_canonical_identity(media, memory_se
     assert coordination.subtitle_media_path(str(subtitle), str(video)) == str(video)
 
 
-@pytest.mark.parametrize('extension', ['.srt', '.vtt'])
-@pytest.mark.parametrize('destination', ['current', 'relative', 'absolute'])
-def test_fresh_saved_sidecar_uses_symlink_video_spelling(media, guard, memory_session, monkeypatch,
-                                                       tmp_path, extension, destination):
-    from app.config import settings
-    from app.database import TableMovies
-    from subliminal_patch.core import get_subtitle_path
-    from subtitles.tools.translate.main import translate_subtitles_file
-    from subzero.language import Language
-
+@pytest.fixture
+def symlink_media(media, guard, memory_session, tmp_path):
     video, _, _ = media
     store = tmp_path / 'store'
     store.mkdir()
     target = store / 'release.mkv'
     video.rename(target)
     video.symlink_to(target)
+    return SimpleNamespace(video=video, target=target, root=tmp_path, session=memory_session, guard=guard)
+
+
+@pytest.fixture
+def saved_sidecar(symlink_media, monkeypatch, extension, destination):
+    from app.config import settings
+    from subliminal_patch.core import get_subtitle_path
+    from subzero.language import Language
+
+    video = symlink_media.video
+    root = symlink_media.root
     monkeypatch.setattr(settings.general, 'subfolder', destination)
-    custom = str(tmp_path / 'captions') if destination == 'absolute' else 'captions'
+    custom = str(root / 'captions') if destination == 'absolute' else 'captions'
     monkeypatch.setattr(settings.general, 'subfolder_custom', custom)
-    folder = tmp_path / 'captions' if destination != 'current' else video.parent
+    folder = root / 'captions' if destination != 'current' else video.parent
     folder.mkdir(exist_ok=True)
     source = folder / Path(get_subtitle_path(str(video), Language('fra'), extension=extension)).name
     source.write_text('1\n00:00:00,000 --> 00:00:01,000\nHello!\n')
-    assert memory_session.get(TableMovies, 7).path == str(video)
-    assert coordination.subtitle_media_path(str(source), str(video), allow_unindexed=True) == str(target)
-    guard(lambda path: (_ for _ in ()).throw(RecoveryRequired(path)))
+    return source
+
+
+@pytest.mark.parametrize('extension', ['.srt', '.vtt'])
+@pytest.mark.parametrize('destination', ['current', 'relative', 'absolute'])
+def test_fresh_saved_sidecar_uses_symlink_video_spelling(symlink_media, saved_sidecar):
+    from app.database import TableMovies
+    from subtitles.tools.translate.main import translate_subtitles_file
+
+    video = symlink_media.video
+    source = saved_sidecar
+    assert symlink_media.session.get(TableMovies, 7).path == str(video)
+    assert coordination.subtitle_media_path(str(source), str(video), allow_unindexed=True) == str(symlink_media.target)
+    symlink_media.guard(lambda path: (_ for _ in ()).throw(RecoveryRequired(path)))
     with pytest.raises(RecoveryRequired, match='release.mkv'):
         translate_subtitles_file(str(video), str(source), 'fr', 'en', False, False,
                                  'movie', None, None, 7, None, job_id=1)
 
 
 @pytest.fixture
-def queued_processing(media, guard, memory_session, monkeypatch, tmp_path):
+def processing_database(memory_session, guard):
+    from sqlalchemy.orm import scoped_session, sessionmaker
+
+    db = scoped_session(sessionmaker(bind=memory_session.get_bind()))
+    try:
+        yield db
+    finally:
+        db.remove()
+
+
+@pytest.fixture
+def queued_processing(media, processing_database, monkeypatch, tmp_path):
     import shlex
     import app.database as app_database
     import app.jobs_queue as queue_module
-    from sqlalchemy.orm import scoped_session, sessionmaker
     from subtitles import processing, sync
     from bazarr.subtitles import sync as queued_sync
     from subtitles.tools import subsyncer
     from subzero.language import Language
 
     video, subtitle, _ = media
-    db = scoped_session(sessionmaker(bind=memory_session.get_bind()))
+    db = processing_database
     for module in (app_database, queue_module, processing):
         monkeypatch.setattr(module, 'database', db)
     queue = queue_module.JobsQueue()
@@ -601,11 +632,8 @@ def queued_processing(media, guard, memory_session, monkeypatch, tmp_path):
     def process():
         return processing.process_subtitle(saved, 'movie', 'English', str(video), 100, job_id=999)
 
-    try:
-        yield SimpleNamespace(queue=queue, process=process, output=output, subtitle=subtitle, video=video,
-                              notifications=notifications, notified=notified, settings=settings)
-    finally:
-        db.remove()
+    return SimpleNamespace(queue=queue, process=process, output=output, subtitle=subtitle, video=video,
+                           notifications=notifications, notified=notified, settings=settings)
 
 
 def test_queued_sync_cancellation_releases_slot_and_retains_postprocessing(queued_processing):
@@ -636,16 +664,10 @@ with media_write_lock(sys.argv[2]):
     with ThreadPoolExecutor(max_workers=2) as pool:
         released = False
         try:
-            for _ in range(500):
-                if ready.exists():
-                    break
-                threading.Event().wait(0.01)
+            _wait_until(lambda: ready.exists())
             assert ready.exists(), 'independent holder did not acquire lock'
             future = pool.submit(state.queue.force_start_pending_job, sync_job.job_id)
-            for _ in range(500):
-                if state.queue.get_job(sync_job.job_id) is not None:
-                    break
-                threading.Event().wait(0.01)
+            _wait_until(lambda: state.queue.get_job(sync_job.job_id) is not None)
             assert state.queue.get_job(sync_job.job_id) is sync_job
             state.queue.cancel_running_job(sync_job.job_id)
             assert future.result(timeout=2) is True
@@ -657,8 +679,7 @@ with media_write_lock(sys.argv[2]):
             finishing = state.queue.jobs_pending_queue[0]
             assert not finishing.is_sync
             finish = pool.submit(state.queue.force_start_pending_job, finishing.job_id)
-            with pytest.raises(TimeoutError):
-                finish.result(timeout=0.15)
+            _assert_future_raises(finish, TimeoutError, timeout=0.15)
             holder.communicate('x', timeout=5)
             released = True
             assert finish.result(timeout=5) is True
@@ -685,10 +706,7 @@ def test_queued_sync_callback_keeps_postprocessing_after_other_exits(queued_proc
             state.settings.subsync.use_subsync_movie_threshold = True
             state.settings.subsync.subsync_movie_threshold = 70
         assert state.queue.force_start_pending_job(sync_job.job_id) is True
-    for _ in range(500):
-        if state.queue.jobs_pending_queue:
-            break
-        threading.Event().wait(0.01)
+    _wait_until(lambda: state.queue.jobs_pending_queue)
     assert not state.output.exists()
     assert not state.notifications
     finishing = state.queue.jobs_pending_queue[0]

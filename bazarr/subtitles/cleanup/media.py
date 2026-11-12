@@ -35,6 +35,21 @@ class _VobSubOptions:
     cancelled: CancelCheck = None
 
 
+@dataclass(frozen=True)
+class _SubtitleSource:
+    path: str
+    source: Literal['embedded', 'external']
+    external: ExternalSubtitle | None
+    stream: dict[str, JSONValue]
+
+
+@dataclass(frozen=True)
+class _RemuxOptions:
+    probe: dict[str, JSONValue]
+    retained: list[dict[str, JSONValue]]
+    cancelled: CancelCheck
+
+
 def _check(cancelled: CancelCheck) -> None:
     if cancelled is not None and cancelled():
         raise CancelledError('Subtitle cleanup was cancelled')
@@ -54,26 +69,29 @@ def _require_space(workspace: Path, required_bytes: int) -> None:
                       f'only {available} bytes are available in {workspace}')
 
 
+def _wait_for_process(process: subprocess.Popen[bytes], cancelled: CancelCheck) -> int:
+    try:
+        while True:
+            try:
+                return process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                _check(cancelled)
+    except BaseException:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise
+
+
 def _run(arguments: list[str], cancelled: CancelCheck = None, output: BinaryIO | None = None) -> bytes:
     _check(cancelled)
     with tempfile.TemporaryFile() as errors, tempfile.TemporaryFile() as captured:
         process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL,
                                    stdout=output if output is not None else captured, stderr=errors)
-        try:
-            while True:
-                try:
-                    code = process.wait(timeout=0.2)
-                    break
-                except subprocess.TimeoutExpired:
-                    _check(cancelled)
-        except BaseException:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            raise
+        code = _wait_for_process(process, cancelled)
         errors.seek(0)
         diagnostics = errors.read(16384)
         if code != 0 or (Path(arguments[0]).name in ('ffmpeg', 'ffprobe') and diagnostics):
@@ -214,31 +232,12 @@ def _select_audio_stream(probe: dict[str, JSONValue], audio_stream_index: int | 
     return audio_streams, audio_stream_index
 
 
-def analyze_media(video_path: str, external_subtitles: Iterable[ExternalSubtitle], workspace: str,
-                  options: AnalysisOptions | None = None) -> MediaAnalysis:
-    options = options or AnalysisOptions()
-    audio_stream_index, cancelled = options.audio_stream_index, options.cancelled
-    video_path = str(Path(video_path).resolve(strict=True))
-    initial_inputs = {video_path: _digest(video_path, cancelled)}
-    workspace_path = Path(workspace)
-    workspace_path.mkdir(parents=True, exist_ok=True)
-    probe = _probe(video_path, cancelled)
-    duration = float(str(_object(probe.get('format', {})).get('duration', 0)))
-    if duration <= 0 or not math.isfinite(duration):
-        raise ValueError('Media has no finite positive presentation duration')
-    audio_streams, audio_stream_index = _select_audio_stream(probe, audio_stream_index)
-    reference: list[float] | None = None
-    audio_error = 'Media has no audio stream'
-    if audio_stream_index is not None:
-        try:
-            reference = _audio_signal(video_path, audio_stream_index, workspace_path, _SignalOptions(duration, cancelled))
-        except (RuntimeError, ValueError) as error:
-            audio_error = str(error)
+def _fingerprint_external_sources(external_subtitles: Iterable[ExternalSubtitle], initial_inputs: dict[str, str],
+                                  cancelled: CancelCheck) -> tuple[list[_SubtitleSource], list[SubtitleTrack], set[str]]:
+    sources: list[_SubtitleSource] = []
     tracks: list[SubtitleTrack] = []
-    sources: list[tuple[str, Literal['embedded', 'external'], ExternalSubtitle | None, dict[str, JSONValue]]] = [
-        (video_path, 'embedded', None, stream) for stream in _streams(probe) if stream.get('codec_type') == 'subtitle']
     companions: set[str] = set()
-    seen = {video_path}
+    seen = set(initial_inputs)
     for external in external_subtitles:
         path = Path(external.path).resolve(strict=True)
         if path.suffix.lower() == '.sub' and _paired_path(path, '.idx').is_file():
@@ -262,34 +261,68 @@ def analyze_media(video_path: str, external_subtitles: Iterable[ExternalSubtitle
             tracks.append(SubtitleTrack(key, 'external', path_string, 0, _language(external.language), external.forced,
                                         external.hearing_impaired, path.suffix.lstrip('.'), None, str(error), [str(_paired_path(path, '.sub'))] if path.suffix.lower() == '.idx' else []))
             continue
-        sources.extend((path_string, 'external', external, stream) for stream in external_streams)
-    for path, source, external, stream in sources:
-        _check(cancelled)
-        index = int(str(stream['index']))
-        codec = str(stream.get('codec_name', 'unknown'))
-        tags, flags = _tags(stream), _flags(stream)
-        language = tags.get('language', external.language if external else 'und')
-        # Multilingual VobSub stream languages take precedence over the sidecar label.
-        if external and Path(path).suffix.lower() != '.idx':
-            language = external.language
-        language = _language(language)
-        key = hashlib.sha256(f'{source}\0{path}\0{index}'.encode()).hexdigest()
-        score, error_message = None, audio_error if reference is None else None
+        sources.extend(_SubtitleSource(path_string, 'external', external, stream) for stream in external_streams)
+    return sources, tracks, companions
+
+
+def _analyze_subtitle(item: _SubtitleSource, reference: list[float] | None, audio_error: str,
+                      options: _SignalOptions) -> SubtitleTrack:
+    path, source, external, stream = item.path, item.source, item.external, item.stream
+    duration, cancelled = options.duration, options.cancelled
+    _check(cancelled)
+    index = int(str(stream['index']))
+    codec = str(stream.get('codec_name', 'unknown'))
+    tags, flags = _tags(stream), _flags(stream)
+    language = tags.get('language', external.language if external else 'und')
+    # Multilingual VobSub stream languages take precedence over the sidecar label.
+    if external and Path(path).suffix.lower() != '.idx':
+        language = external.language
+    language = _language(language)
+    key = hashlib.sha256(f'{source}\0{path}\0{index}'.encode()).hexdigest()
+    score, error_message = None, audio_error if reference is None else None
+    try:
+        if codec == 'microdvd':
+            with open(path, 'rb') as subtitle:
+                header = subtitle.read(256).decode('ascii', errors='replace')
+            if re.match(r'(?:\{1\}\{1\}|\{0\}\{0\})\d+(?:\.\d+)?(?:\r?\n|$)', header) is None:
+                raise ValueError('MicroDVD timing has no explicit frame rate; an assumed frame rate cannot be scored')
+        intervals = _events(path, index, _SignalOptions(duration, cancelled, codec in ('hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle')))
+        if reference is not None:
+            score, error_message = pearson_score(reference, display_signal(intervals, duration))
+    except (RuntimeError, ValueError) as error:
+        error_message = str(error)
+    return SubtitleTrack(key, source, path, index, language,
+                         bool(flags.get('forced', 0)) or bool(external and external.forced),
+                         bool(flags.get('hearing_impaired', 0)) or bool(external and external.hearing_impaired),
+                         codec, score, error_message, [str(_paired_path(Path(path), '.sub'))] if source == 'external' and Path(path).suffix.lower() == '.idx' else [])
+
+
+def analyze_media(video_path: str, external_subtitles: Iterable[ExternalSubtitle], workspace: str,
+                  options: AnalysisOptions | None = None) -> MediaAnalysis:
+    options = options or AnalysisOptions()
+    audio_stream_index, cancelled = options.audio_stream_index, options.cancelled
+    video_path = str(Path(video_path).resolve(strict=True))
+    initial_inputs = {video_path: _digest(video_path, cancelled)}
+    workspace_path = Path(workspace)
+    workspace_path.mkdir(parents=True, exist_ok=True)
+    probe = _probe(video_path, cancelled)
+    duration = float(str(_object(probe.get('format', {})).get('duration', 0)))
+    if duration <= 0 or not math.isfinite(duration):
+        raise ValueError('Media has no finite positive presentation duration')
+    audio_streams, audio_stream_index = _select_audio_stream(probe, audio_stream_index)
+    reference: list[float] | None = None
+    audio_error = 'Media has no audio stream'
+    if audio_stream_index is not None:
         try:
-            if codec == 'microdvd':
-                with open(path, 'rb') as subtitle:
-                    header = subtitle.read(256).decode('ascii', errors='replace')
-                if re.match(r'(?:\{1\}\{1\}|\{0\}\{0\})\d+(?:\.\d+)?(?:\r?\n|$)', header) is None:
-                    raise ValueError('MicroDVD timing has no explicit frame rate; an assumed frame rate cannot be scored')
-            intervals = _events(path, index, _SignalOptions(duration, cancelled, codec in ('hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle')))
-            if reference is not None:
-                score, error_message = pearson_score(reference, display_signal(intervals, duration))
+            reference = _audio_signal(video_path, audio_stream_index, workspace_path, _SignalOptions(duration, cancelled))
         except (RuntimeError, ValueError) as error:
-            error_message = str(error)
-        tracks.append(SubtitleTrack(key, source, path, index, language,
-                                    bool(flags.get('forced', 0)) or bool(external and external.forced),
-                                    bool(flags.get('hearing_impaired', 0)) or bool(external and external.hearing_impaired),
-                                    codec, score, error_message, [str(_paired_path(Path(path), '.sub'))] if source == 'external' and Path(path).suffix.lower() == '.idx' else []))
+            audio_error = str(error)
+    sources = [_SubtitleSource(video_path, 'embedded', None, stream)
+               for stream in _streams(probe) if stream.get('codec_type') == 'subtitle']
+    external_sources, tracks, companions = _fingerprint_external_sources(external_subtitles, initial_inputs, cancelled)
+    sources.extend(external_sources)
+    for source in sources:
+        tracks.append(_analyze_subtitle(source, reference, audio_error, _SignalOptions(duration, cancelled)))
     paths = sorted({video_path, *(track.path for track in tracks), *companions})
     final_inputs = {path: _digest(path, cancelled) for path in paths}
     if initial_inputs != final_inputs:
@@ -430,6 +463,60 @@ def _normalize_vobsub_input(path: str, directory: Path) -> str:
     return input_path
 
 
+def _mkv_dispositions(stream: dict[str, JSONValue], track_id: int) -> list[str]:
+    arguments: list[str] = []
+    flag_names = {'default': 'default', 'forced': 'forced-display', 'hearing_impaired': 'hearing-impaired',
+                  'visual_impaired': 'visual-impaired', 'descriptions': 'text-descriptions',
+                  'original': 'original', 'comment': 'commentary'}
+    for flag, option in flag_names.items():
+        if flag == 'original' and not (_flags(stream).get('original') or _flags(stream).get('dub')):
+            continue
+        arguments += [f'--{option}-flag' if option != 'default' else '--default-track-flag',
+                      f'{track_id}:{int(bool(_flags(stream).get(flag, 0)))}']
+    return arguments
+
+
+def _remux_matroska(path: str, output: Path, options: _RemuxOptions) -> None:
+    probe, retained, cancelled = options.probe, options.retained, options.cancelled
+    matroska = 'matroska' in str(_object(probe.get('format', {})).get('format_name', ''))
+    input_path = _normalize_vobsub_input(path, output.parent)
+    mapping = _mkv_mapping(input_path, probe, cancelled)
+    subtitle_ids = [mapping[int(str(stream['index']))] for stream in retained if stream.get('codec_type') == 'subtitle']
+    arguments = [_tool('mkvmerge'), '--no-date', '-o', str(output)]
+    if matroska:
+        segment_info = output.parent / 'segment-info.xml'
+        ET.ElementTree(_segment_info(path, cancelled)).write(segment_info, encoding='utf-8', xml_declaration=True)
+        arguments += ['--segmentinfo', str(segment_info)]
+    arguments += ['--subtitle-tracks', ','.join(map(str, subtitle_ids))] if subtitle_ids else ['--no-subtitles']
+    for stream in retained:
+        index = int(str(stream['index']))
+        if index not in mapping:
+            continue
+        arguments += _mkv_dispositions(stream, mapping[index])
+    order = ','.join(f'0:{mapping[int(str(stream["index"]))]}' for stream in retained
+                     if int(str(stream['index'])) in mapping)
+    arguments += ['--track-order', order, input_path]
+    _run(arguments, cancelled)
+    creation_time = _tags(_object(probe.get('format', {}))).get('creation_time')
+    if creation_time:
+        creation_time = re.sub(r'\.0+Z$', 'Z', creation_time)
+        _run([_tool('mkvpropedit'), str(output), '--edit', 'info', '--set', f'date={creation_time}'], cancelled)
+
+
+def _remux_ffmpeg(path: str, output: Path, options: _RemuxOptions) -> None:
+    probe, retained, cancelled = options.probe, options.retained, options.cancelled
+    arguments = [_tool('ffmpeg'), '-v', 'error', '-nostdin', '-copyts', '-i', path]
+    for stream in retained:
+        arguments += ['-map', f'0:{stream["index"]}']
+    arguments += ['-map_metadata', '0', '-map_chapters', '0', '-copy_unknown', '-c', 'copy', '-avoid_negative_ts', 'disabled']
+    for index, stream in enumerate(retained):
+        flags = '+'.join(flag for flag, value in _flags(stream).items() if value)
+        arguments += [f'-disposition:{index}', flags or '0']
+    if 'mov' in str(_object(probe.get('format', {})).get('format_name', '')).split(','):
+        arguments += ['-write_btrt', '0', '-movflags', 'use_metadata_tags']
+    _run(arguments + ['-n', str(output)], cancelled)
+
+
 def _remux(path: str, output: Path, remove: set[int], cancelled: CancelCheck) -> None:
     probe = _probe(path, cancelled)
     streams = _streams(probe)
@@ -437,47 +524,11 @@ def _remux(path: str, output: Path, remove: set[int], cancelled: CancelCheck) ->
         raise ValueError('Container program metadata preservation is unsupported; originals remain unchanged')
     retained = [stream for stream in streams if int(str(stream['index'])) not in remove]
     matroska = 'matroska' in str(_object(probe.get('format', {})).get('format_name', ''))
+    options = _RemuxOptions(probe, retained, cancelled)
     if matroska or Path(path).suffix.lower() == '.idx':
-        input_path = _normalize_vobsub_input(path, output.parent)
-        mapping = _mkv_mapping(input_path, probe, cancelled)
-        subtitle_ids = [mapping[int(str(stream['index']))] for stream in retained if stream.get('codec_type') == 'subtitle']
-        arguments = [_tool('mkvmerge'), '--no-date', '-o', str(output)]
-        if matroska:
-            segment_info = output.parent / 'segment-info.xml'
-            ET.ElementTree(_segment_info(path, cancelled)).write(segment_info, encoding='utf-8', xml_declaration=True)
-            arguments += ['--segmentinfo', str(segment_info)]
-        arguments += ['--subtitle-tracks', ','.join(map(str, subtitle_ids))] if subtitle_ids else ['--no-subtitles']
-        flag_names = {'default': 'default', 'forced': 'forced-display', 'hearing_impaired': 'hearing-impaired',
-                      'visual_impaired': 'visual-impaired', 'descriptions': 'text-descriptions',
-                      'original': 'original', 'comment': 'commentary'}
-        for stream in retained:
-            index = int(str(stream['index']))
-            if index not in mapping:
-                continue
-            for flag, option in flag_names.items():
-                if flag == 'original' and not (_flags(stream).get('original') or _flags(stream).get('dub')):
-                    continue
-                arguments += [f'--{option}-flag' if option != 'default' else '--default-track-flag',
-                              f'{mapping[index]}:{int(bool(_flags(stream).get(flag, 0)))}']
-        order = ','.join(f'0:{mapping[int(str(stream["index"]))]}' for stream in retained
-                         if int(str(stream['index'])) in mapping)
-        arguments += ['--track-order', order, input_path]
-        _run(arguments, cancelled)
-        creation_time = _tags(_object(probe.get('format', {}))).get('creation_time')
-        if creation_time:
-            creation_time = re.sub(r'\.0+Z$', 'Z', creation_time)
-            _run([_tool('mkvpropedit'), str(output), '--edit', 'info', '--set', f'date={creation_time}'], cancelled)
+        _remux_matroska(path, output, options)
     else:
-        arguments = [_tool('ffmpeg'), '-v', 'error', '-nostdin', '-copyts', '-i', path]
-        for stream in retained:
-            arguments += ['-map', f'0:{stream["index"]}']
-        arguments += ['-map_metadata', '0', '-map_chapters', '0', '-copy_unknown', '-c', 'copy', '-avoid_negative_ts', 'disabled']
-        for index, stream in enumerate(retained):
-            flags = '+'.join(flag for flag, value in _flags(stream).items() if value)
-            arguments += [f'-disposition:{index}', flags or '0']
-        if 'mov' in str(_object(probe.get('format', {})).get('format_name', '')).split(','):
-            arguments += ['-write_btrt', '0', '-movflags', 'use_metadata_tags']
-        _run(arguments + ['-n', str(output)], cancelled)
+        _remux_ffmpeg(path, output, options)
     _verify(path, str(output), remove, cancelled)
 
 
@@ -513,10 +564,23 @@ def _xml_state(element: ET.Element) -> JSONValue:
             element.text if len(element) == 0 else None, [_xml_state(child) for child in element]]
 
 
-def _matroska_metadata(path: str, removed_uids: set[str], cancelled: CancelCheck) -> dict[str, JSONValue]:
-    result: dict[str, JSONValue] = {'segment_info': _xml_state(_segment_info(path, cancelled))}
+def _filter_matroska_tags(document: ET.Element, removed_uids: set[str]) -> None:
     statistics = {'BPS', 'DURATION', 'NUMBER_OF_FRAMES', 'NUMBER_OF_BYTES', '_STATISTICS_WRITING_APP',
                   '_STATISTICS_WRITING_DATE_UTC', '_STATISTICS_TAGS'}
+    for tag in list(document):
+        targets = tag.find('Targets')
+        if targets is not None and any(uid.text in removed_uids for uid in targets.findall('TrackUID')):
+            document.remove(tag)
+            continue
+        for simple in list(tag.findall('Simple')):
+            if simple.findtext('Name') in statistics:
+                tag.remove(simple)
+        if not tag.findall('Simple'):
+            document.remove(tag)
+
+
+def _matroska_metadata(path: str, removed_uids: set[str], cancelled: CancelCheck) -> dict[str, JSONValue]:
+    result: dict[str, JSONValue] = {'segment_info': _xml_state(_segment_info(path, cancelled))}
     for kind in ('tags', 'chapters'):
         raw = _run([_tool('mkvextract'), path, kind], cancelled)
         if not raw.strip():
@@ -524,18 +588,22 @@ def _matroska_metadata(path: str, removed_uids: set[str], cancelled: CancelCheck
             continue
         document = ET.fromstring(raw)
         if kind == 'tags':
-            for tag in list(document):
-                targets = tag.find('Targets')
-                if targets is not None and any(uid.text in removed_uids for uid in targets.findall('TrackUID')):
-                    document.remove(tag)
-                    continue
-                for simple in list(tag.findall('Simple')):
-                    if simple.findtext('Name') in statistics:
-                        tag.remove(simple)
-                if not tag.findall('Simple'):
-                    document.remove(tag)
+            _filter_matroska_tags(document, removed_uids)
         result[kind] = _xml_state(document)
     return result
+
+
+def _verify_stream_properties(source: dict[str, JSONValue], target: dict[str, JSONValue]) -> None:
+    old_index = int(str(source['index']))
+    fields = ('codec_name', 'codec_type', 'profile', 'width', 'height', 'pix_fmt', 'sample_rate', 'channels',
+              'channel_layout', 'extradata_hash', 'sample_aspect_ratio', 'color_range', 'color_space',
+              'color_transfer', 'color_primaries', 'field_order', 'side_data_list')
+    if any(source.get(field) != target.get(field) for field in fields):
+        raise ValueError(f'Staged replacement changed retained stream {old_index} codec properties')
+    if _flags(source) != _flags(target):
+        raise ValueError(f'Staged replacement changed retained stream {old_index} dispositions')
+    if _semantic_tags(source) != _semantic_tags(target):
+        raise ValueError(f'Staged replacement changed retained stream {old_index} metadata')
 
 
 def _verify(original: str, staged: str, remove: set[int], cancelled: CancelCheck) -> None:
@@ -548,17 +616,9 @@ def _verify(original: str, staged: str, remove: set[int], cancelled: CancelCheck
     after_subtitles = {int(str(stream['index'])) for stream in output if stream.get('codec_type') == 'subtitle'}
     before_packets = _packet_signatures(original, before_subtitles, cancelled)
     after_packets = _packet_signatures(staged, after_subtitles, cancelled)
-    fields = ('codec_name', 'codec_type', 'profile', 'width', 'height', 'pix_fmt', 'sample_rate', 'channels',
-              'channel_layout', 'extradata_hash', 'sample_aspect_ratio', 'color_range', 'color_space',
-              'color_transfer', 'color_primaries', 'field_order', 'side_data_list')
     for source, target in zip(retained, output):
         old_index, new_index = int(str(source['index'])), int(str(target['index']))
-        if any(source.get(field) != target.get(field) for field in fields):
-            raise ValueError(f'Staged replacement changed retained stream {old_index} codec properties')
-        if _flags(source) != _flags(target):
-            raise ValueError(f'Staged replacement changed retained stream {old_index} dispositions')
-        if _semantic_tags(source) != _semantic_tags(target):
-            raise ValueError(f'Staged replacement changed retained stream {old_index} metadata')
+        _verify_stream_properties(source, target)
         if before_packets.get(old_index) != after_packets.get(new_index):
             raise ValueError(f'Staged replacement changed retained stream {old_index} payload or presentation timestamps')
         if source.get('codec_type') == 'subtitle':
@@ -582,41 +642,50 @@ def _verify(original: str, staged: str, remove: set[int], cancelled: CancelCheck
         raise ValueError('Staged replacement changed chapters')
 
 
+def _vobsub_payload(packets: BinaryIO, code: int, stream_id: int) -> bytes:
+    length = packets.read(2)
+    if len(length) != 2:
+        raise ValueError('Truncated VobSub packet header')
+    size = int.from_bytes(length, 'big')
+    payload = bytearray(packets.read(size))
+    if not size or len(payload) != size:
+        raise ValueError('Truncated or unbounded VobSub packet')
+    if code == 0xbd:
+        if len(payload) < 3 or payload[0] & 0xc0 != 0x80:
+            raise ValueError('Unsupported VobSub PES header')
+        position = 3 + payload[2]
+        if position >= len(payload) or not 0x20 <= payload[position] <= 0x3f:
+            raise ValueError('Invalid VobSub private subtitle stream')
+        payload[position] = 0x20 + stream_id
+    return length + payload
+
+
+def _vobsub_packet(packets: BinaryIO, prefix: bytes, stream_id: int) -> bytes:
+    if len(prefix) != 4 or prefix[:3] != b'\x00\x00\x01':
+        raise ValueError('Unsupported VobSub MPEG packet framing')
+    code = prefix[3]
+    if code == 0xba:
+        header = packets.read(10)
+        if len(header) != 10 or header[0] & 0xc0 != 0x40:
+            raise ValueError('Unsupported VobSub MPEG pack header')
+        size = header[9] & 7
+        stuffing = packets.read(size)
+        if len(stuffing) != size:
+            raise ValueError('Truncated VobSub MPEG pack header')
+        packet = prefix + header + stuffing
+    elif code == 0xb9:
+        packet = prefix
+    else:
+        packet = prefix + _vobsub_payload(packets, code, stream_id)
+    return packet
+
+
 def _copy_vobsub(source: Path, destination: BinaryIO, stream_id: int, cancelled: CancelCheck) -> int:
     written = 0
     with source.open('rb') as packets:
         while prefix := packets.read(4):
             _check(cancelled)
-            if len(prefix) != 4 or prefix[:3] != b'\x00\x00\x01':
-                raise ValueError('Unsupported VobSub MPEG packet framing')
-            code = prefix[3]
-            if code == 0xba:
-                header = packets.read(10)
-                if len(header) != 10 or header[0] & 0xc0 != 0x40:
-                    raise ValueError('Unsupported VobSub MPEG pack header')
-                size = header[9] & 7
-                stuffing = packets.read(size)
-                if len(stuffing) != size:
-                    raise ValueError('Truncated VobSub MPEG pack header')
-                packet = prefix + header + stuffing
-            elif code == 0xb9:
-                packet = prefix
-            else:
-                length = packets.read(2)
-                if len(length) != 2:
-                    raise ValueError('Truncated VobSub packet header')
-                size = int.from_bytes(length, 'big')
-                payload = bytearray(packets.read(size))
-                if not size or len(payload) != size:
-                    raise ValueError('Truncated or unbounded VobSub packet')
-                if code == 0xbd:
-                    if len(payload) < 3 or payload[0] & 0xc0 != 0x80:
-                        raise ValueError('Unsupported VobSub PES header')
-                    position = 3 + payload[2]
-                    if position >= len(payload) or not 0x20 <= payload[position] <= 0x3f:
-                        raise ValueError('Invalid VobSub private subtitle stream')
-                    payload[position] = 0x20 + stream_id
-                packet = prefix + length + payload
+            packet = _vobsub_packet(packets, prefix, stream_id)
             destination.write(packet)
             written += len(packet)
     return written
@@ -684,6 +753,14 @@ def _staging_directory(by_path: dict[str, list[SubtitleTrack]], keep: set[str], 
     return Path(tempfile.mkdtemp(prefix='prepared-', dir=workspace_path)) if rewritten_paths else workspace_path
 
 
+def _removed_external_files(path: str) -> list[PreparedFile]:
+    source = Path(path)
+    removed = [PreparedFile(path, None)]
+    if source.suffix.lower() == '.idx':
+        removed.append(PreparedFile(str(_paired_path(source, '.sub')), None))
+    return removed
+
+
 def prepare_outputs(analysis: MediaAnalysis, keep_keys: Iterable[str], workspace: str,
                     cancelled: CancelCheck = None) -> list[PreparedFile]:
     keep = set(keep_keys)
@@ -709,9 +786,7 @@ def prepare_outputs(analysis: MediaAnalysis, keep_keys: Iterable[str], workspace
         retained = [track for track in tracks if track.key in keep]
         source = Path(path)
         if tracks[0].source == 'external' and not retained:
-            prepared.append(PreparedFile(path, None))
-            if source.suffix.lower() == '.idx':
-                prepared.append(PreparedFile(str(_paired_path(source, '.sub')), None))
+            prepared.extend(_removed_external_files(path))
             continue
         output_dir = stage / hashlib.sha256(path.encode()).hexdigest()
         output_dir.mkdir()

@@ -79,30 +79,29 @@ def delete_subtitles(media_type, language, forced, hi, media_path, subtitles_pat
                 logging.exception(f'BAZARR cannot delete subtitles file: {subtitles_path}')
                 store_subtitles(sonarr_episode_id)
                 return False
-            else:
-                store_subtitles(sonarr_episode_id)
-                history_log(0, sonarr_series_id, sonarr_episode_id, result)
-                notify_sonarr(sonarr_series_id)
-                event_stream(type='series', action='update', payload=sonarr_series_id)
-                event_stream(type='episode-wanted', action='update', payload=sonarr_episode_id)
+            store_subtitles(sonarr_episode_id)
+            history_log(0, sonarr_series_id, sonarr_episode_id, result)
+            notify_sonarr(sonarr_series_id)
+            event_stream(type='series', action='update', payload=sonarr_series_id)
+            event_stream(type='episode-wanted', action='update', payload=sonarr_episode_id)
 
-                if settings.general.use_plex and settings.plex.update_series_library and metadata:
-                    plex_refresh_item(metadata.imdbId, is_movie=False, season=metadata.season,
-                                      episode=metadata.episode)
-                if settings.general.use_jellyfin and settings.jellyfin.update_series_library and metadata:
-                    jellyfin_refresh_item(metadata.imdbId, is_movie=False, season=metadata.season,
-                                          episode=metadata.episode, tvdb_id=metadata.tvdbId)
+            if settings.general.use_plex and settings.plex.update_series_library and metadata:
+                plex_refresh_item(metadata.imdbId, is_movie=False, season=metadata.season,
+                                  episode=metadata.episode)
+            if settings.general.use_jellyfin and settings.jellyfin.update_series_library and metadata:
+                jellyfin_refresh_item(metadata.imdbId, is_movie=False, season=metadata.season,
+                                      episode=metadata.episode, tvdb_id=metadata.tvdbId)
 
-                # Call external webhook after all processing is complete
-                call_external_webhook(
-                    subtitle_path=subtitles_path,
-                    media_path=media_path,
-                    language=language_log,
-                    media_type=media_type,
-                    action_type='delete'
-                )
+            # Call external webhook after all processing is complete
+            call_external_webhook(
+                subtitle_path=subtitles_path,
+                media_path=media_path,
+                language=language_log,
+                media_type=media_type,
+                action_type='delete'
+            )
 
-                return True
+            return True
         else:
             try:
                 os.remove(pr(subtitles_path))
@@ -110,25 +109,24 @@ def delete_subtitles(media_type, language, forced, hi, media_path, subtitles_pat
                 logging.exception(f'BAZARR cannot delete subtitles file: {subtitles_path}')
                 store_subtitles_movie(radarr_id)
                 return False
-            else:
-                store_subtitles_movie(radarr_id)
-                history_log_movie(0, radarr_id, result)
-                notify_radarr(radarr_id)
-                event_stream(type='movie-wanted', action='update', payload=radarr_id)
+            store_subtitles_movie(radarr_id)
+            history_log_movie(0, radarr_id, result)
+            notify_radarr(radarr_id)
+            event_stream(type='movie-wanted', action='update', payload=radarr_id)
 
-                if settings.general.use_plex and settings.plex.update_movie_library and metadata:
-                    plex_refresh_item(metadata.imdbId, is_movie=True)
-                if settings.general.use_jellyfin and settings.jellyfin.update_movie_library and metadata:
-                    jellyfin_refresh_item(metadata.imdbId, is_movie=True,
-                                          tmdb_id=metadata.tmdbId)
+            if settings.general.use_plex and settings.plex.update_movie_library and metadata:
+                plex_refresh_item(metadata.imdbId, is_movie=True)
+            if settings.general.use_jellyfin and settings.jellyfin.update_movie_library and metadata:
+                jellyfin_refresh_item(metadata.imdbId, is_movie=True,
+                                      tmdb_id=metadata.tmdbId)
 
-                # Call external webhook after all processing is complete
-                call_external_webhook(
-                    subtitle_path=subtitles_path,
-                    media_path=media_path,
-                    language=language_log,
-                    media_type=media_type,
-                    action_type='delete'
-                )
-            
-                return True
+            # Call external webhook after all processing is complete
+            call_external_webhook(
+                subtitle_path=subtitles_path,
+                media_path=media_path,
+                language=language_log,
+                media_type=media_type,
+                action_type='delete'
+            )
+
+            return True
