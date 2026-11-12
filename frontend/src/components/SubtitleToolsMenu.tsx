@@ -7,6 +7,8 @@ import {
 } from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { useSubtitleAction } from "@/apis/hooks";
+import { CleanupMedia } from "@/apis/raw/cleanup";
+import SubtitleCleanupModal from "@/components/modals/SubtitleCleanupModal";
 import { useModals } from "@/modules/modals";
 import { task } from "@/modules/task";
 import { useTools } from "./useTools";
@@ -14,6 +16,7 @@ import styles from "./SubtitleToolsMenu.module.scss";
 
 interface Props {
   selections: FormType.ModifySubtitle[];
+  cleanupMedia?: CleanupMedia[];
   children?: ReactElement;
   menu?: Omit<MenuProps, "children">;
   onAction?: (action: "delete" | "search") => void;
@@ -21,6 +24,7 @@ interface Props {
 
 const SubtitleToolsMenu: FunctionComponent<Props> = ({
   selections,
+  cleanupMedia,
   children,
   menu,
   onAction,
@@ -65,6 +69,17 @@ const SubtitleToolsMenu: FunctionComponent<Props> = ({
     <Menu withArrow withinPortal position="left-end" {...menu}>
       <Menu.Target>{children}</Menu.Target>
       <Menu.Dropdown>
+        {cleanupMedia && cleanupMedia.length > 0 && (
+          <Menu.Item
+            onClick={() =>
+              modals.openContextModal(SubtitleCleanupModal, {
+                media: cleanupMedia,
+              })
+            }
+          >
+            Cleanup redundant subtitles...
+          </Menu.Item>
+        )}
         {showTools && (
           <>
             <Menu.Label>Tools</Menu.Label>

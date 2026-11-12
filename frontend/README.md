@@ -100,3 +100,23 @@ Builds the app in production mode and save to the `build` folder.
 Format code for all files in `frontend` folder
 
 This command will be automatically triggered before any commits to git. Run manually if you modify `.prettierignore` or `.prettierrc`.
+
+## Subtitle cleanup
+
+Use **Cleanup subtitles** on a series episode page or **Cleanup redundant subtitles...**
+on a movie's More Actions or subtitle menu. The movie list also offers cleanup in
+Select mode. The shared dialog lets you select media, create independent previews,
+choose the audio reference, review keepers and removals, and confirm all selected
+previews before files change. Embedded tracks and external format companions are
+included. Jobs continue after the dialog closes; select a previous cleanup to
+inspect results or restore its verified backup.
+
+Cleanup uses a new speech-timing Pearson correlation (-1 to 1). Historical download
+match percentages are shown separately. Within each language and forced-caption
+group, normal and hearing-impaired tracks compete. Fully rankable groups allow
+only a highest-scoring keeper; tied maxima and groups with unrankable tracks need
+an explicit choice. Timing cannot establish translation quality, completeness,
+language correctness or actual redundancy. Review lost caption variants, physical
+rewrites/deletions, backup location and required free space before confirming.
+Changing the audio reference requires another preview. Stale previews and changed
+files are refused by the server; restore refuses to overwrite later edits.

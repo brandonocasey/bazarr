@@ -33,6 +33,7 @@ import { ItemEditModal } from "@/components/forms/ItemEditForm";
 import { MovieUploadModal } from "@/components/forms/MovieUploadForm";
 import { MovieHistoryModal, SubtitleToolsModal } from "@/components/modals";
 import { MovieSearchModal } from "@/components/modals/ManualSearchModal";
+import SubtitleCleanupModal from "@/components/modals/SubtitleCleanupModal";
 import { useModals } from "@/modules/modals";
 import { notification, task, TaskGroup } from "@/modules/task";
 import ItemOverview from "@/pages/views/ItemOverview";
@@ -218,6 +219,22 @@ const MovieDetailView: FunctionComponent = () => {
                 />
               </Menu.Target>
               <Menu.Dropdown>
+                <Menu.Item
+                  onClick={() => {
+                    if (movie)
+                      modals.openContextModal(SubtitleCleanupModal, {
+                        media: [
+                          {
+                            media_type: "movie",
+                            media_id: movie.radarrId,
+                            title: movie.title,
+                          },
+                        ],
+                      });
+                  }}
+                >
+                  Cleanup redundant subtitles...
+                </Menu.Item>
                 <Menu.Item
                   leftSection={<FontAwesomeIcon icon={faToolbox} />}
                   onClick={() => {

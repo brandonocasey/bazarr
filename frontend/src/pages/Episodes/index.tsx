@@ -33,11 +33,13 @@ import {
   useSeriesModification,
 } from "@/apis/hooks";
 import { useInstanceName } from "@/apis/hooks/site";
+import { CleanupMedia } from "@/apis/raw/cleanup";
 import { Toolbox, UploadDropzone } from "@/components";
 import { QueryOverlay } from "@/components/async";
 import { ItemEditModal } from "@/components/forms/ItemEditForm";
 import { SeriesUploadModal } from "@/components/forms/SeriesUploadForm";
 import { SubtitleToolsModal } from "@/components/modals";
+import SubtitleCleanupModal from "@/components/modals/SubtitleCleanupModal";
 import { type AppTable as TableInstance } from "@/components/tables/features";
 import { useModals } from "@/modules/modals";
 import { notification, task, TaskGroup } from "@/modules/task";
@@ -136,6 +138,22 @@ const SeriesEpisodesView: FunctionComponent = () => {
         ></UploadDropzone>
         <Toolbox>
           <Group gap="xs">
+            <Toolbox.Button
+              icon={faBriefcase}
+              disabled={!episodes?.length || hasTask}
+              onClick={() => {
+                if (episodes)
+                  modals.openContextModal(SubtitleCleanupModal, {
+                    media: episodes.map((episode): CleanupMedia => ({
+                      media_type: "series",
+                      media_id: episode.sonarrEpisodeId,
+                      title: `${series?.title ?? ""} - ${episode.title}`,
+                    })),
+                  });
+              }}
+            >
+              Cleanup subtitles
+            </Toolbox.Button>
             <Toolbox.Button
               icon={faSync}
               disabled={!available || hasTask}

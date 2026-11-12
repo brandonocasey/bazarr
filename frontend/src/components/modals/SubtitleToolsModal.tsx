@@ -25,6 +25,7 @@ import {
   useEpisodeSubtitleModification,
   useMovieSubtitleModification,
 } from "@/apis/hooks";
+import { CleanupMedia } from "@/apis/raw/cleanup";
 import Language from "@/components/bazarr/Language";
 import SubtitleToolsMenu from "@/components/SubtitleToolsMenu";
 import {
@@ -34,6 +35,7 @@ import {
 import SimpleTable from "@/components/tables/SimpleTable";
 import { useModals, withModal } from "@/modules/modals";
 import { fromPython, isMovie, toPython } from "@/utilities";
+import SubtitleCleanupModal from "./SubtitleCleanupModal";
 
 type SupportType = Item.Episode | Item.Movie;
 
@@ -399,6 +401,23 @@ export const SubtitleToolView: FunctionComponent<SubtitleToolViewProps> = ({
         style={{ bottom: 0, position: "sticky", zIndex: 10 }}
       >
         <Stack gap="xs">
+          <Button
+            variant="light"
+            onClick={() =>
+              modals.openContextModal(SubtitleCleanupModal, {
+                media: payload.map((item): CleanupMedia => {
+                  const local = getLocalisedValues(item);
+                  return {
+                    media_type: local.isMovie ? "movie" : "series",
+                    media_id: local.id,
+                    title: local.name,
+                  };
+                }),
+              })
+            }
+          >
+            Cleanup redundant subtitles...
+          </Button>
           <Group justify="space-between">
             <SubtitleToolsMenu
               selections={selections}

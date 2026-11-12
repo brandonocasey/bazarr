@@ -190,4 +190,19 @@ describe("SubtitleToolsMenu", () => {
       }),
     );
   });
+  it("opens cleanup for embedded tracks using the explicit media identity", async () => {
+    const cleanupMedia = [
+      { media_type: "series" as const, media_id: 99, title: "Episode 99" },
+    ];
+    const { openContextModal } = renderMenu({
+      selections: [embeddedSelection],
+      cleanupMedia,
+    });
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Open"));
+    await user.click(await screen.findByText("Cleanup redundant subtitles..."));
+    expect(openContextModal).toHaveBeenCalledWith(expect.any(Function), {
+      media: cleanupMedia,
+    });
+  });
 });

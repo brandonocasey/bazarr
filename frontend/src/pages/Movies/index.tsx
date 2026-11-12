@@ -206,6 +206,7 @@ const MovieView: FunctionComponent = () => {
         useTags={useMovieTags}
         statePrefix="movies"
         useAllItems={useMovies}
+        cleanupMediaType="movie"
         modifyMutation={modifyMovie}
       ></ItemView>
     </Container>
