@@ -9,6 +9,7 @@ from app.event_handler import event_stream
 from app.config import settings
 from app.database import database, TableShows, TableEpisodes, TableMovies, select
 from languages.get_languages import language_from_alpha2
+from utilities.media_write_lock import media_write_lock, subtitle_media_path
 from utilities.path_mappings import path_mappings
 from utilities.autopulse_webhook import call_external_webhook
 from subtitles.indexer.series import store_subtitles
@@ -59,24 +60,25 @@ def delete_subtitles(media_type, language, forced, hi, media_path, subtitles_pat
             select(TableMovies.imdbId, TableMovies.tmdbId)
             .where(TableMovies.radarrId == radarr_id)).first()
 
-    result = ProcessSubtitlesResult(message=f"{language_string} subtitles deleted from disk.",
-                                    reversed_path=prr(media_path),
-                                    downloaded_language_code2=language_log,
-                                    downloaded_provider=None,
-                                    score=None,
-                                    forced=None,
-                                    subtitle_id=None,
-                                    reversed_subtitles_path=prr(subtitles_path),
-                                    hearing_impaired=None)
+    video_path = subtitle_media_path(pr(subtitles_path), media_path)
+    with media_write_lock(video_path):
+        result = ProcessSubtitlesResult(message=f"{language_string} subtitles deleted from disk.",
+                                        reversed_path=prr(media_path),
+                                        downloaded_language_code2=language_log,
+                                        downloaded_provider=None,
+                                        score=None,
+                                        forced=None,
+                                        subtitle_id=None,
+                                        reversed_subtitles_path=prr(subtitles_path),
+                                        hearing_impaired=None)
 
-    if media_type == 'series':
-        try:
-            os.remove(pr(subtitles_path))
-        except OSError:
-            logging.exception(f'BAZARR cannot delete subtitles file: {subtitles_path}')
-            store_subtitles(sonarr_episode_id)
-            return False
-        else:
+        if media_type == 'series':
+            try:
+                os.remove(pr(subtitles_path))
+            except OSError:
+                logging.exception(f'BAZARR cannot delete subtitles file: {subtitles_path}')
+                store_subtitles(sonarr_episode_id)
+                return False
             store_subtitles(sonarr_episode_id)
             history_log(0, sonarr_series_id, sonarr_episode_id, result)
             notify_sonarr(sonarr_series_id)
@@ -100,14 +102,13 @@ def delete_subtitles(media_type, language, forced, hi, media_path, subtitles_pat
             )
 
             return True
-    else:
-        try:
-            os.remove(pr(subtitles_path))
-        except OSError:
-            logging.exception(f'BAZARR cannot delete subtitles file: {subtitles_path}')
-            store_subtitles_movie(radarr_id)
-            return False
         else:
+            try:
+                os.remove(pr(subtitles_path))
+            except OSError:
+                logging.exception(f'BAZARR cannot delete subtitles file: {subtitles_path}')
+                store_subtitles_movie(radarr_id)
+                return False
             store_subtitles_movie(radarr_id)
             history_log_movie(0, radarr_id, result)
             notify_radarr(radarr_id)
@@ -127,5 +128,5 @@ def delete_subtitles(media_type, language, forced, hi, media_path, subtitles_pat
                 media_type=media_type,
                 action_type='delete'
             )
-            
+
             return True

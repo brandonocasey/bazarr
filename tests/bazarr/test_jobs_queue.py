@@ -9,7 +9,11 @@ def queue(monkeypatch):
     monkeypatch.setattr(jobs_queue_module, "event_stream", lambda **kwargs: None)
     monkeypatch.setattr(jobs_queue_module.settings.general, "concurrent_jobs", 3)
     monkeypatch.setattr(jobs_queue_module.settings.subsync, "concurrent_syncs", 1)
-    return JobsQueue()
+    from subtitles import sync
+
+    queue = JobsQueue()
+    monkeypatch.setattr(sync, "jobs_queue", queue)
+    return queue
 
 
 def _add_sync(queue, srt_path):
@@ -116,6 +120,11 @@ def test_removing_pending_job_runs_its_callback(queue, monkeypatch):
     _add_sync_with_callback(queue, "b.srt", calls)
 
     assert queue.remove_job_from_pending_queue(job_id) is True
+    assert calls == []
+    assert len(queue.jobs_pending_queue) == 2
+    callback_job = queue.jobs_pending_queue[-1]
+    assert not callback_job.is_sync
+    assert queue.force_start_pending_job(callback_job.job_id) is True
     assert calls == ["a.srt"]
     assert len(queue.jobs_pending_queue) == 1
 
@@ -134,6 +143,11 @@ def test_emptying_pending_queue_runs_callbacks(queue, monkeypatch):
     _add_sync_with_callback(queue, "b.srt", calls)
 
     assert queue.empty_jobs_queue("pending") is True
+    assert calls == []
+    assert len(queue.jobs_pending_queue) == 3
+    for job in list(queue.jobs_pending_queue):
+        assert not job.is_sync
+        assert queue.force_start_pending_job(job.job_id) is True
     # a failing callback doesn't prevent the next ones from running
     assert calls == ["a.srt", "b.srt"]
     assert list(queue.jobs_pending_queue) == []

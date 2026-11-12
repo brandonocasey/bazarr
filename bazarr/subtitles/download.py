@@ -15,6 +15,7 @@ from app.database import (TableEpisodes, TableMovies, TableMissingSubtitles, dat
                           get_subtitles)
 from app.jobs_queue import jobs_queue
 from constants import HI_EXCLUDED
+from utilities.media_write_lock import media_write_lock, subtitle_media_path
 from utilities.path_mappings import path_mappings
 from utilities.helper import get_target_folder, force_unicode
 from languages.get_languages import alpha3_from_alpha2, alpha2_from_alpha3
@@ -273,24 +274,27 @@ def generate_subtitles(path, languages, audio_language, sceneName, title, media_
                             subtitle_formats.add(s.format)
 
                         try:
-                            fld = get_target_folder(path)
-                            chmod = int(settings.general.chmod, 8) if not sys.platform.startswith(
-                                'win') and settings.general.chmod_enabled else None
-                            if is_upgrade and previous_subtitles_to_delete:
-                                try:
-                                    # delete previously downloaded subtitles in case of an upgrade to prevent edge loop
-                                    # issue.
-                                    os.remove(previous_subtitles_to_delete)
-                                except (OSError, FileNotFoundError):
-                                    pass
-                            saved_subtitles = save_subtitles(video.original_path, subtitles,
-                                                             single=settings.general.single_language,
-                                                             tags=None,  # fixme
-                                                             directory=fld,
-                                                             chmod=chmod,
-                                                             formats=subtitle_formats,
-                                                             path_decoder=force_unicode
-                                                             )
+                            with media_write_lock(video.original_path, job_id=job_id):
+                                fld = get_target_folder(path)
+                                chmod = int(settings.general.chmod, 8) if not sys.platform.startswith(
+                                    'win') and settings.general.chmod_enabled else None
+                                if is_upgrade and previous_subtitles_to_delete:
+                                    subtitle_media_path(previous_subtitles_to_delete, video.original_path,
+                                                        allow_unindexed=True)
+                                    try:
+                                        # delete previously downloaded subtitles in case of an upgrade to prevent edge loop
+                                        # issue.
+                                        os.remove(previous_subtitles_to_delete)
+                                    except (OSError, FileNotFoundError):
+                                        pass
+                                saved_subtitles = save_subtitles(video.original_path, subtitles,
+                                                                 single=settings.general.single_language,
+                                                                 tags=None,  # fixme
+                                                                 directory=fld,
+                                                                 chmod=chmod,
+                                                                 formats=subtitle_formats,
+                                                                 path_decoder=force_unicode
+                                                                 )
                         # for decode/reencode errors ONLY, add the subtitles file to the blacklist so they're not re-tried endlessly.
                         # Purposely only catches UnicodeError as an IO error etc should not blacklist a file. UnicodeError handles
                         # UnicodeEncodeError, UnicodeDecodeError and UnicodeTranslateError cases.

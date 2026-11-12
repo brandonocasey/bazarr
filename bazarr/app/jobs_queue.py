@@ -219,17 +219,14 @@ class JobsQueue:
             If no matches are found, an empty list is returned.
         :rtype: list[dict]
         """
-        queues = self.jobs_pending_queue + self.jobs_running_queue + self.jobs_failed_queue + self.jobs_canceled_queue + self.jobs_completed_queue
-        if status:
-            try:
-                queues = self.__dict__[f'jobs_{status}_queue']
-            except KeyError:
-                return []
-
-        if job_id:
-            return [vars(job) for job in queues if job.job_id == job_id]
-        else:
-            return [vars(job) for job in queues]
+        with self._queue_lock:
+            queues = self.jobs_pending_queue + self.jobs_running_queue + self.jobs_failed_queue + self.jobs_canceled_queue + self.jobs_completed_queue
+            if status:
+                try:
+                    queues = self.__dict__[f'jobs_{status}_queue']
+                except KeyError:
+                    return []
+            return [vars(job).copy() for job in queues if not job_id or job.job_id == job_id]
 
     def get_job_status(self, job_id: int):
         """
@@ -446,18 +443,21 @@ class JobsQueue:
                  True if the job was removed, otherwise False.
         :rtype: bool
         """
-        for job in self.jobs_pending_queue:
-            if job.job_id == job_id and job.status == 'pending':
-                try:
-                    self.jobs_pending_queue.remove(job)
-                except ValueError:
-                    return False
-                else:
-                    logging.debug(f"Task {job.job_name} ({job.job_id}) removed from queue")
-                    event_stream(type='jobs', action='delete', payload={"job_id": job.job_id})
-                    self._run_callbacks_of_removed_jobs([job])
-                    return True
-        return False
+        with self._queue_lock:
+            job = self._pending_job(job_id)
+            if job is None:
+                return False
+            try:
+                self.jobs_pending_queue.remove(job)
+            except ValueError:
+                return False
+        logging.debug(f"Task {job.job_name} ({job.job_id}) removed from queue")
+        event_stream(type='jobs', action='delete', payload={"job_id": job.job_id})
+        self._run_callbacks_of_removed_jobs([job])
+        return True
+
+    def _pending_job(self, job_id: int) -> Job | None:
+        return next((job for job in self.jobs_pending_queue if job.job_id == job_id and job.status == 'pending'), None)
 
     def move_job_in_pending_queue(self, job_id: int, move_destination: str) -> bool:
         """
@@ -475,30 +475,25 @@ class JobsQueue:
         :return: A boolean indicating whether the operation was successful.
         :rtype: bool
         """
-        for job in self.jobs_pending_queue:
-            if job.job_id == job_id and job.status == 'pending':
-                try:
-                    self.jobs_pending_queue.remove(job)
-                except ValueError:
+        if move_destination not in ('top', 'bottom'):
+            logging.error(f"Invalid move destination: {move_destination}. Accepted values are 'top' and 'bottom'")
+            return False
+        try:
+            with self._queue_lock:
+                job = self._pending_job(job_id)
+                if job is None:
                     return False
-                except Exception as e:
-                    logging.exception(f"Unhandled exception while trying to move job {job.job_name} ({job.job_id}) in "
-                                      f"pending queue: {e}")
-                    return False
-                else:
-                    if move_destination == 'top':
-                        self.jobs_pending_queue.appendleft(job)
-                    elif move_destination == 'bottom':
-                        self.jobs_pending_queue.append(job)
-                    else:
-                        logging.error(f"Invalid move destination: {move_destination}. Accepted values are 'top' and "
-                                      f"'bottom'")
-                        return False
-                    logging.debug(f"Task {job.job_name} ({job.job_id}) moved to {move_destination} of the pending "
-                                  f"queue")
-                    event_stream(type='jobs', action='update', payload={"job_id": job.job_id})
-                    return True
-        return False
+                self.jobs_pending_queue.remove(job)
+                append = self.jobs_pending_queue.appendleft if move_destination == 'top' else self.jobs_pending_queue.append
+                append(job)
+        except ValueError:
+            return False
+        except Exception as error:
+            logging.exception(f"Unhandled exception while trying to move job {job_id} in pending queue: {error}")
+            return False
+        logging.debug(f"Task {job.job_name} ({job.job_id}) moved to {move_destination} of the pending queue")
+        event_stream(type='jobs', action='update', payload={"job_id": job.job_id})
+        return True
 
     def force_start_pending_job(self, job_id: int) -> bool:
         """
@@ -511,11 +506,13 @@ class JobsQueue:
         :return: A boolean value indicating whether the job was successfully initiated.
         :rtype: bool
         """
-        for job in self.jobs_pending_queue:
-            if job.job_id == job_id and job.status == 'pending':
-                self._run_job(job_instance=job)
-                return True
-        return False
+        with self._queue_lock:
+            job = self._pending_job(job_id)
+            if job is None:
+                return False
+            self._claim_pending_job(job)
+        self._run_job(job_instance=job, reserved=True)
+        return True
 
     def empty_jobs_queue(self, queue_name: str):
         """
@@ -546,13 +543,18 @@ class JobsQueue:
         """
         Some jobs get a callback that must run once they're done, ex: post-processing and notifications after a
         subtitles sync. Runs those callbacks for jobs removed from the pending queue before running, so they aren't
-        lost. They run in a separate thread to not block the caller (ex: an API request).
+        lost. Sync callbacks become separate jobs; other callbacks run in a separate thread.
 
         :param jobs: Jobs removed from the pending queue.
         :type jobs: list[Job]
         """
         callbacks = [(job, job.kwargs['callback']) for job in jobs
                      if job.kwargs and callable(job.kwargs.get('callback'))]
+        for job, callback in callbacks:
+            if job.is_sync:
+                from subtitles.sync import queue_post_sync_callback
+                queue_post_sync_callback(callback, job.kwargs.get('srt_path'))
+        callbacks = [(job, callback) for job, callback in callbacks if not job.is_sync]
         if not callbacks:
             return
 
@@ -634,6 +636,13 @@ class JobsQueue:
             except (KeyboardInterrupt, SystemExit):
                 break
 
+    def _claim_pending_job(self, job: Job) -> Job:
+        """Move a pending job to running; callers MUST hold `_queue_lock`."""
+        self.jobs_pending_queue.remove(job)
+        job.status = 'running'
+        self.jobs_running_queue.append(job)
+        return job
+
     def _reserve_next_runnable_job(self):
         """
         Picks the first pending job allowed to run given the concurrent jobs limit and the concurrent syncs limit,
@@ -652,10 +661,7 @@ class JobsQueue:
             for job in self.jobs_pending_queue:
                 if job.is_sync and not can_run_sync:
                     continue
-                self.jobs_pending_queue.remove(job)
-                job.status = 'running'
-                self.jobs_running_queue.append(job)
-                return job
+                return self._claim_pending_job(job)
             return None
 
     def _run_job(self, job_instance=None, reserved=False) -> bool:
@@ -677,25 +683,19 @@ class JobsQueue:
             if job_instance and reserved:
                 job = job_instance
             elif job_instance:
-                job = job_instance
-                self.jobs_pending_queue.remove(job)
+                job = self._claim_pending_job(job_instance)
             else:
                 if not self.jobs_pending_queue:
                     return False
-                job = self.jobs_pending_queue.popleft()
+                job = self._claim_pending_job(self.jobs_pending_queue[0])
     
         if not job:
             sleep(0.1)
             return False
         try:
-            job.status = 'running'
             job.last_run_time = datetime.now(timezone.utc).isoformat()
             if 'job_id' not in job.kwargs or not job.kwargs['job_id']:
                 job.kwargs['job_id'] = job.job_id
-            if not reserved:
-                with self._queue_lock:
-                    self.jobs_running_queue.append(job)
-
             # sending event to update the status of progress jobs
             payload = {"job_id": job.job_id, "status": job.status}
             if job.is_progress:
@@ -714,20 +714,23 @@ class JobsQueue:
             job.job_returned_value = getattr(module, job.func)(*job.args, **job.kwargs)
         except JobCanceled:
             logging.debug(f"Job {job.job_name} ({job.job_id}) canceled by user")
-            job.status = 'canceled'
-            self.jobs_running_queue.remove(job)
-            self.jobs_canceled_queue.append(job)
+            with self._queue_lock:
+                job.status = 'canceled'
+                self.jobs_running_queue.remove(job)
+                self.jobs_canceled_queue.append(job)
             return True
         except Exception as e:
             logging.exception(f"Exception raised while running function: {e}")
-            job.status = 'failed'
-            self.jobs_running_queue.remove(job)
-            self.jobs_failed_queue.append(job)
+            with self._queue_lock:
+                job.status = 'failed'
+                self.jobs_running_queue.remove(job)
+                self.jobs_failed_queue.append(job)
             return False
         else:
-            job.status = 'completed'
-            self.jobs_running_queue.remove(job)
-            self.jobs_completed_queue.append(job)
+            with self._queue_lock:
+                job.status = 'completed'
+                self.jobs_running_queue.remove(job)
+                self.jobs_completed_queue.append(job)
             return True
         finally:
             database.remove()  # close this specific thread scoped_session to prevent connection exhaustion on PostgreSQL

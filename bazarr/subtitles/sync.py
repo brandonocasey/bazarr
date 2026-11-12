@@ -28,7 +28,10 @@ def sync_subtitles(video_path,
                    quality_max_framerate_deviation=None):
     if not settings.subsync.use_subsync and not force_sync:
         logging.debug('BAZARR automatic syncing is disabled in settings. Skipping sync routine.')
-        _run_callback(callback, srt_path)
+        if job_id:
+            queue_post_sync_callback(callback, srt_path)
+        else:
+            _run_callback(callback, srt_path)
         return False
 
     if not job_id:
@@ -46,12 +49,18 @@ def sync_subtitles(video_path,
                                quality_max_offset_seconds=quality_max_offset_seconds,
                                quality_max_framerate_deviation=quality_max_framerate_deviation)
     finally:
-        # always run the callback (ex: post-processing and notifications) once the sync job is done, even if the sync
-        # was skipped, failed or canceled, so it isn't lost now that sync runs in its own job
-        _run_callback(callback, srt_path)
+        # Required callbacks may wait for another writer even after sync cancellation.
+        # That wait MUST stay outside the sync concurrency limit.
+        queue_post_sync_callback(callback, srt_path)
 
 
-def _run_callback(callback, srt_path):
+def queue_post_sync_callback(callback, srt_path):
+    if callback and callable(callback):
+        jobs_queue.feed_jobs_pending_queue(f"Post-processing {srt_path}", __name__, '_run_callback',
+                                          kwargs={'callback': callback, 'srt_path': srt_path})
+
+
+def _run_callback(callback, srt_path, job_id=None):
     if callback and callable(callback):
         try:
             callback()

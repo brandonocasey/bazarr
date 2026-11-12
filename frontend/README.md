@@ -100,3 +100,30 @@ Builds the app in production mode and save to the `build` folder.
 Format code for all files in `frontend` folder
 
 This command will be automatically triggered before any commits to git. Run manually if you modify `.prettierignore` or `.prettierrc`.
+
+## Subtitle cleanup
+
+Install FFmpeg and MKVToolNix on Bazarr's host before using cleanup.
+Make `ffmpeg`, `ffprobe`, `mkvmerge`, `mkvextract`, and `mkvpropedit` available on its `PATH`.
+
+Use **Cleanup subtitles** on a series episode page.
+On movies, choose **Cleanup redundant subtitles...** from More Actions or the subtitle menu.
+Movie Select mode also offers cleanup.
+
+Select media and create independent previews before confirming any writes.
+Choose the audio reference and review every keeper, removal, caption loss and physical change.
+Embedded tracks and external format companions are included.
+Jobs continue after the dialog closes.
+
+Select a previous cleanup to inspect results or restore its verified backup.
+Preview details show the backup location when available.
+A missing location is labeled unavailable.
+Review required free space before confirming.
+
+Read the [timing score and cleanup safeguards](../docs/redundant-subtitle-cleanup-design.md)
+before selecting keepers.
+Make an explicit choice for tied or unrankable groups.
+Create another preview after changing the audio reference or source files.
+
+Confirm again after refreshing an operation.
+Check for later edits before restoring a backup.

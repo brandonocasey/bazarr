@@ -1,8 +1,10 @@
 import { UseMutationResult } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw/http";
 import { beforeEach, describe, expect, it, vi, vitest } from "vitest";
 import { AppColumnDef as ColumnDef } from "@/components/tables/features";
 import { customRender, screen, within } from "@/tests";
+import server from "@/tests/mocks/node";
 import ItemView from "./ItemView";
 
 vi.mock("@/apis/hooks", async (importOriginal) => ({
@@ -319,5 +321,75 @@ describe("ItemView", () => {
     expect(
       await screen.findByRole("columnheader", { name: "Name" }),
     ).toBeInTheDocument();
+  });
+  it("opens bulk cleanup only for selected movies with the correct media identity", async () => {
+    const body = vi.fn();
+    server.use(
+      http.get("/api/subtitles/cleanup", () => HttpResponse.json({ data: [] })),
+      http.post("/api/subtitles/cleanup/preview", async ({ request }) => {
+        body(await request.json());
+        return HttpResponse.json(
+          {
+            id: "bulk-movie7",
+            media_type: "movie",
+            media_id: 7,
+            title: "Selected Movie",
+            status: "queued",
+            analysis: null,
+            groups: [],
+            files: [],
+            preview_token: "bulk-token",
+            required_space_bytes: 0,
+            backup_path: null,
+            result: null,
+            error: null,
+            created_at: "2026-11-12",
+          },
+          { status: 202 },
+        );
+      }),
+    );
+    const selectedMovie = {
+      tags: [],
+      radarrId: 7,
+      title: "Selected Movie",
+    } as unknown as Item.Movie;
+    const decoyMovie = { ...selectedMovie, radarrId: 8, title: "Other Movie" };
+    const movieColumns: ColumnDef<Item.Movie>[] = [
+      { header: "Name", accessorKey: "title" },
+    ];
+    const movieQuery: RangeQuery<Item.Movie> = () =>
+      Promise.resolve({ data: [selectedMovie, decoyMovie], total: 2 });
+    customRender(
+      <ItemView
+        queryKey={["cleanup-movies"]}
+        queryFn={movieQuery}
+        columns={movieColumns}
+        useAllItems={mockUseAllItems}
+        modifyMutation={mockMutation}
+        filterConfig={filterConfig}
+        cleanupMediaType="movie"
+      />,
+    );
+    const user = userEvent.setup();
+    await screen.findByRole("row", { name: "Selected Movie" });
+    await user.click(screen.getByRole("button", { name: "Select" }));
+    expect(
+      screen.getByRole("button", { name: "Cleanup subtitles" }),
+    ).toBeDisabled();
+    await user.click(
+      within(screen.getByRole("row", { name: "Selected Movie" })).getByRole(
+        "checkbox",
+      ),
+    );
+    await user.click(screen.getByRole("button", { name: "Cleanup subtitles" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Preview selected media" }),
+    );
+    await screen.findByText(/Operation bulk-movie7: queued/);
+    expect(body).toHaveBeenCalledExactlyOnceWith({
+      media_type: "movie",
+      media_id: 7,
+    });
   });
 });

@@ -78,6 +78,9 @@ const Table: FunctionComponent<Props> = ({ movie, disabled }) => {
     return (
       <SubtitleToolsMenu
         selections={selections}
+        cleanupMedia={[
+          { media_type: "movie", media_id: movie.radarrId, title: movie.title },
+        ]}
         onAction={async (action) => {
           if (action === "delete" && path) {
             await remove.mutateAsync({

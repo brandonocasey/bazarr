@@ -14,6 +14,7 @@ from subliminal_patch.score import compute_score, DEFAULT_SCORES
 from languages.get_languages import alpha3_from_alpha2, alpha2_from_alpha3
 from app.config import settings, get_array_from
 from constants import HI_EXCLUDED
+from utilities.media_write_lock import media_write_lock
 from utilities.helper import get_target_folder, force_unicode
 from utilities.path_mappings import path_mappings
 from app.database import (database, get_profiles_list, select, TableEpisodes, TableShows, get_audio_profile_languages,
@@ -219,13 +220,14 @@ def manual_download_subtitle(path, audio_language, hi, forced, subtitle, provide
             try:
                 chmod = int(settings.general.chmod, 8) if not sys.platform.startswith(
                     'win') and settings.general.chmod_enabled else None
-                saved_subtitles = save_subtitles(video.original_path, [subtitle],
-                                                 single=settings.general.single_language,
-                                                 tags=None,  # fixme
-                                                 directory=get_target_folder(path),
-                                                 chmod=chmod,
-                                                 formats=(subtitle.format,),
-                                                 path_decoder=force_unicode)
+                with media_write_lock(video.original_path, job_id=job_id):
+                    saved_subtitles = save_subtitles(video.original_path, [subtitle],
+                                                     single=settings.general.single_language,
+                                                     tags=None,  # fixme
+                                                     directory=get_target_folder(path),
+                                                     chmod=chmod,
+                                                     formats=(subtitle.format,),
+                                                     path_decoder=force_unicode)
             except Exception as e:
                 logging.exception(f'BAZARR Error saving Subtitles file to disk for this file {path}: {str(e)}')
                 return 'Error saving Subtitles file to disk'

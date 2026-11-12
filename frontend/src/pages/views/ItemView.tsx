@@ -57,10 +57,12 @@ import {
   Toolbox,
 } from "@/components";
 import LanguageProfileName from "@/components/bazarr/LanguageProfile";
+import SubtitleCleanupModal from "@/components/modals/SubtitleCleanupModal";
 import {
   AppColumnDef as ColumnDef,
   AppHeader as Header,
 } from "@/components/tables/features";
+import { useModals } from "@/modules/modals";
 import { GetItemId, GetItemIds, useListQueryState } from "@/utilities";
 import { BulkSelection, useBulkSelection } from "@/utilities/bulkSelection";
 import { useResetOnChange } from "@/utilities/resetOnChange";
@@ -142,6 +144,7 @@ interface Props<T extends Item.Base = Item.Base> {
     UseQueryResult<T[]>,
     "data" | "isSuccess" | "isFetching" | "isError"
   >;
+  cleanupMediaType?: "movie";
   modifyMutation: UseMutationResult<void, unknown, FormType.ModifyItem>;
 }
 
@@ -434,6 +437,7 @@ interface ToolboxProps {
   loadedLabel: string;
   onSelectAllMatching: () => void;
   isSelectingAllMatching: boolean;
+  cleanupMediaType?: "movie";
   modifyMutation: UseMutationResult<void, unknown, FormType.ModifyItem>;
 }
 
@@ -465,7 +469,9 @@ const ItemViewToolbox = ({
   onSelectAllMatching,
   isSelectingAllMatching,
   modifyMutation,
+  cleanupMediaType,
 }: ToolboxProps) => {
+  const modals = useModals();
   const [filtersOpened, setFiltersOpened] = useState(false);
 
   // Collapse the inline filter controls into a popover button when they no
@@ -545,6 +551,23 @@ const ItemViewToolbox = ({
             isSelectingAllMatching={isSelectingAllMatching}
           ></BulkActionBarControls>
         </Group>
+        {cleanupMediaType && (
+          <Button
+            variant="light"
+            disabled={bulkSelection.selectedIds.size === 0}
+            onClick={() =>
+              modals.openContextModal(SubtitleCleanupModal, {
+                media: [...bulkSelection.selectedIds].map((id) => ({
+                  media_type: cleanupMediaType,
+                  media_id: id,
+                  title: `Movie ${id}`,
+                })),
+              })
+            }
+          >
+            Cleanup subtitles
+          </Button>
+        )}
         <BulkActionBarSaveButton
           selection={bulkSelection}
           mutation={modifyMutation}
@@ -904,6 +927,7 @@ const ItemView = <T extends Item.Base>({
   statePrefix,
   useAllItems,
   modifyMutation,
+  cleanupMediaType,
 }: Props<T>) => {
   const [viewMode, setViewMode] = useViewMode(viewModeKey ?? "item-view-mode");
   const { query, setSort, setFilter } = useListQueryState(statePrefix);
@@ -955,6 +979,7 @@ const ItemView = <T extends Item.Base>({
     setSort,
     setFilter,
     bulkSelection,
+    cleanupMediaType,
   };
 
   // Only one view is mounted at a time, keeping a single active query. Each
