@@ -205,43 +205,29 @@ def test_recovery_pending_survives_apply_failure_until_rollback_and_staging_clea
     assert store.get_operation(operation['id'])['error'] == failed['error']
 
 
-def test_recovery_migration_preserves_legacy_rows_and_is_additive():
+def test_cleanup_migration_creates_table_with_recovery_pending_and_is_repeatable():
     from importlib import import_module
     import sqlalchemy as sa
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
 
-    migration = import_module('migrations.versions.7d3e8b2f5a12_cleanup_recovery_pending')
-    previous = import_module('migrations.versions.6c2d7a9e4b11_subtitle_cleanup')
-    statuses = ['queued', 'analyzing', 'ready', 'applying', 'restoring', 'failed', 'complete', 'restored']
-    legacy = sa.create_engine('sqlite://')
-    with legacy.begin() as connection:
-        with Operations.context(MigrationContext.configure(connection)):
-            previous.upgrade()
-        for status in statuses:
-            connection.exec_driver_sql(
-                'INSERT INTO table_subtitle_cleanup_operations '
-                '(id, media_type, media_id, video_path, status, payload, created_at) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?)',
-                (status, 'movie', 1, '/missing/video.mkv', status, 'preserved', '2026-01-01'))
-        columns = [column['name'] for column in sa.inspect(connection).get_columns(
-            'table_subtitle_cleanup_operations')]
+    migration = import_module('migrations.versions.7d3e8b2f5a12_subtitle_cleanup')
+    engine = sa.create_engine('sqlite://')
+    with engine.begin() as connection:
         with Operations.context(MigrationContext.configure(connection)):
             migration.upgrade()
             migration.upgrade()
-        assert connection.exec_driver_sql(
-            'SELECT id, payload, recovery_pending FROM table_subtitle_cleanup_operations ORDER BY id').all() == [
-                (status, 'preserved', int(status in ('applying', 'restoring', 'failed')))
-                for status in sorted(statuses)]
         assert [column['name'] for column in sa.inspect(connection).get_columns(
-            'table_subtitle_cleanup_operations')] == [*columns, 'recovery_pending']
+            'table_subtitle_cleanup_operations')] == [
+                'id', 'media_type', 'media_id', 'video_path', 'status', 'job_id', 'recovery_pending', 'payload',
+                'created_at']
         connection.exec_driver_sql(
             'INSERT INTO table_subtitle_cleanup_operations '
             '(id, media_type, media_id, video_path, status, payload, created_at) '
             "VALUES ('fresh', 'movie', 1, '/missing/fresh.mkv', 'queued', 'fresh payload', '2026-01-01')")
         assert connection.exec_driver_sql(
             "SELECT recovery_pending FROM table_subtitle_cleanup_operations WHERE id = 'fresh'").scalar() == 0
-    legacy.dispose()
+    engine.dispose()
 
 
 def test_batch_status_uses_chunked_database_reads(library):
