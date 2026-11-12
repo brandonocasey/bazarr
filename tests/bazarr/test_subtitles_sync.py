@@ -98,6 +98,22 @@ def _patch_subsyncer(monkeypatch, sync_result):
     return subsyncer_module.SubSyncer(), captured
 
 
+@pytest.fixture
+def indexed_sync_media(memory_session, monkeypatch, tmp_path):
+    import app.database as app_database
+    from app.database import TableShows, TableEpisodes, TableEpisodesSubtitles
+
+    monkeypatch.setattr(app_database, "database", memory_session)
+    memory_session.add(TableShows(sonarrSeriesId=1, path="/media/show", title="Show"))
+    memory_session.commit()
+    memory_session.add(TableEpisodes(sonarrSeriesId=1, sonarrEpisodeId=2,
+                                     path="/media/show/episode.mkv", season=1, episode=1, title="Pilot"))
+    memory_session.commit()
+    memory_session.add(TableEpisodesSubtitles(sonarrSeriesId=1, sonarrEpisodeId=2, language="en",
+                                              hi=False, forced=False, path=str(tmp_path / "episode.en.srt")))
+    memory_session.commit()
+
+
 def _sync(subsyncer, srt_path, no_fix_framerate=True):
     return subsyncer.sync(video_path="/media/show/episode.mkv", srt_path=str(srt_path), srt_lang="en", hi=False,
                           forced=False, max_offset_seconds="60", no_fix_framerate=no_fix_framerate, gss=False,
@@ -105,7 +121,7 @@ def _sync(subsyncer, srt_path, no_fix_framerate=True):
                           quality_max_offset_seconds=30, quality_max_framerate_deviation=0.1)
 
 
-def test_subsyncer_enables_quality_checks_without_framerate_fixing(monkeypatch, tmp_path):
+def test_subsyncer_enables_quality_checks_without_framerate_fixing(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, {"sync_was_successful": True, "offset_seconds": 1.0,
@@ -119,7 +135,7 @@ def test_subsyncer_enables_quality_checks_without_framerate_fixing(monkeypatch, 
     assert captured["args"].quality_max_offset_seconds == 30.0
 
 
-def test_subsyncer_enables_quality_checks_with_framerate_fixing(monkeypatch, tmp_path):
+def test_subsyncer_enables_quality_checks_with_framerate_fixing(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, {"sync_was_successful": True, "offset_seconds": 1.0,
@@ -132,7 +148,7 @@ def test_subsyncer_enables_quality_checks_with_framerate_fixing(monkeypatch, tmp
     assert captured["args"].max_framerate_deviation == 0.1
 
 
-def test_subsyncer_keeps_original_when_sync_rejected(monkeypatch, tmp_path):
+def test_subsyncer_keeps_original_when_sync_rejected(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, {"sync_was_successful": False, "offset_seconds": None,
@@ -145,7 +161,7 @@ def test_subsyncer_keeps_original_when_sync_rejected(monkeypatch, tmp_path):
     assert "history" not in captured
 
 
-def test_subsyncer_replaces_original_when_sync_succeeds(monkeypatch, tmp_path):
+def test_subsyncer_replaces_original_when_sync_succeeds(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, {"sync_was_successful": True, "offset_seconds": 1.0,
@@ -171,6 +187,24 @@ def _patch_common(monkeypatch, subsyncer=FakeSubSyncer):
     FakeSubSyncer.calls = []
 
 
+@pytest.fixture
+def callback_queue(monkeypatch):
+    from app.jobs_queue import JobsQueue
+
+    queue = JobsQueue()
+    monkeypatch.setattr(sync_module, "jobs_queue", queue)
+    return queue
+
+
+def _finish_callback(queue, calls):
+    assert calls == []
+    assert len(queue.jobs_pending_queue) == 1
+    job = queue.jobs_pending_queue[0]
+    assert not job.is_sync
+    assert queue.force_start_pending_job(job.job_id) is True
+    assert list(queue.jobs_pending_queue) == []
+
+
 def _sync_with_callback(callback, percent_score=100):
     return sync_module.sync_subtitles(
         video_path="/media/movie.mkv",
@@ -185,17 +219,17 @@ def _sync_with_callback(callback, percent_score=100):
     )
 
 
-def test_sync_subtitles_runs_callback_after_sync(monkeypatch):
+def test_sync_subtitles_runs_callback_after_sync(monkeypatch, callback_queue):
     _patch_common(monkeypatch)
     monkeypatch.setattr(sync_module.settings.subsync, "use_subsync_movie_threshold", False)
     calls = []
 
     assert _sync_with_callback(lambda: calls.append(len(FakeSubSyncer.calls))) is True
-    # callback runs once, after the sync itself
+    _finish_callback(callback_queue, calls)
     assert calls == [1]
 
 
-def test_sync_subtitles_runs_callback_when_threshold_skips_sync(monkeypatch):
+def test_sync_subtitles_runs_callback_when_threshold_skips_sync(monkeypatch, callback_queue):
     _patch_common(monkeypatch)
     monkeypatch.setattr(sync_module.settings.subsync, "use_subsync_movie_threshold", True)
     monkeypatch.setattr(sync_module.settings.subsync, "subsync_movie_threshold", 70)
@@ -203,15 +237,17 @@ def test_sync_subtitles_runs_callback_when_threshold_skips_sync(monkeypatch):
 
     assert _sync_with_callback(lambda: calls.append(True), percent_score=100) is False
     assert FakeSubSyncer.calls == []
+    _finish_callback(callback_queue, calls)
     assert calls == [True]
 
 
-def test_sync_subtitles_runs_callback_when_sync_fails(monkeypatch):
+def test_sync_subtitles_runs_callback_when_sync_fails(monkeypatch, callback_queue):
     _patch_common(monkeypatch, subsyncer=FailingSubSyncer)
     monkeypatch.setattr(sync_module.settings.subsync, "use_subsync_movie_threshold", False)
     calls = []
 
     assert _sync_with_callback(lambda: calls.append(True)) is False
+    _finish_callback(callback_queue, calls)
     assert calls == [True]
 
 
@@ -267,18 +303,18 @@ class CanceledSubSyncer:
         raise sync_module.JobCanceled
 
 
-def test_sync_subtitles_propagates_cancel_and_runs_callback(monkeypatch):
+def test_sync_subtitles_propagates_cancel_and_runs_callback(monkeypatch, callback_queue):
     _patch_common(monkeypatch, subsyncer=CanceledSubSyncer)
     monkeypatch.setattr(sync_module.settings.subsync, "use_subsync_movie_threshold", False)
     calls = []
 
     with pytest.raises(sync_module.JobCanceled):
         _sync_with_callback(lambda: calls.append(True))
-    # the downloaded subtitles are still there (unsynced), so post-processing and notifications still happen
+    _finish_callback(callback_queue, calls)
     assert calls == [True]
 
 
-def test_subsyncer_removes_partial_output_when_canceled(monkeypatch, tmp_path):
+def test_subsyncer_removes_partial_output_when_canceled(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, None)

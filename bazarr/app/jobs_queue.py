@@ -546,13 +546,18 @@ class JobsQueue:
         """
         Some jobs get a callback that must run once they're done, ex: post-processing and notifications after a
         subtitles sync. Runs those callbacks for jobs removed from the pending queue before running, so they aren't
-        lost. They run in a separate thread to not block the caller (ex: an API request).
+        lost. Sync callbacks become separate jobs; other callbacks run in a separate thread.
 
         :param jobs: Jobs removed from the pending queue.
         :type jobs: list[Job]
         """
         callbacks = [(job, job.kwargs['callback']) for job in jobs
                      if job.kwargs and callable(job.kwargs.get('callback'))]
+        for job, callback in callbacks:
+            if job.is_sync:
+                from subtitles.sync import queue_post_sync_callback
+                queue_post_sync_callback(callback, job.kwargs.get('srt_path'))
+        callbacks = [(job, callback) for job, callback in callbacks if not job.is_sync]
         if not callbacks:
             return
 
