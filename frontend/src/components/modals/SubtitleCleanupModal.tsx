@@ -42,10 +42,14 @@ const defaultKeeper = (group: CleanupGroup) => {
   return "";
 };
 
+type TrackResolution = {
+  retained: Set<string>;
+  resolved: Set<string>;
+};
+
 const trackDisposition = (
   key: string,
-  retained: Set<string>,
-  resolved: Set<string>,
+  { retained, resolved }: TrackResolution,
 ) => {
   if (retained.has(key)) return "KEEP";
   if (resolved.has(key)) return "REMOVE";
@@ -54,8 +58,7 @@ const trackDisposition = (
 
 const physicalAction = (
   tracks: CleanupTrack[],
-  retained: Set<string>,
-  resolved: Set<string>,
+  { retained, resolved }: TrackResolution,
 ) => {
   if (tracks.some((track) => !resolved.has(track.key)))
     return "Awaiting keeper selection";
@@ -70,8 +73,7 @@ const physicalAction = (
 
 const recordedDisposition = (
   key: string,
-  retained: Set<string>,
-  removed: Set<string>,
+  { retained, removed }: { retained: Set<string>; removed: Set<string> },
 ) => {
   if (retained.has(key)) return "Recorded retained track";
   if (removed.has(key)) return "Recorded removed track";
@@ -183,8 +185,8 @@ const OperationPreview = ({
                       )}
                       {track && (
                         <Text size="sm" style={{ overflowWrap: "anywhere" }}>
-                          {trackDisposition(key, retained, resolved)}: timing
-                          correlation{" "}
+                          {trackDisposition(key, { retained, resolved })}:
+                          timing correlation{" "}
                           {track.score === null
                             ? `unrankable (${track.error ?? "no usable signal"})`
                             : String(track.score)}
@@ -226,7 +228,7 @@ const OperationPreview = ({
           {changes.flatMap((unit) =>
             unit.paths.map((path) => (
               <Text key={path} size="sm" style={{ overflowWrap: "anywhere" }}>
-                {physicalAction(unit.tracks, retained, resolved)}: {path}
+                {physicalAction(unit.tracks, { retained, resolved })}: {path}
               </Text>
             )),
           )}
@@ -634,11 +636,10 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
                           size="sm"
                           style={{ overflowWrap: "anywhere" }}
                         >
-                          {recordedDisposition(
-                            track.key,
-                            retainedResults,
-                            removedResults,
-                          )}
+                          {recordedDisposition(track.key, {
+                            retained: retainedResults,
+                            removed: removedResults,
+                          })}
                           : {trackDescription(track)}
                         </Text>
                       ))}
