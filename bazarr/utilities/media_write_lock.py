@@ -148,7 +148,7 @@ def _thread_lock(lock: _MediaLock, job_id: int | None, *, blocking: bool = True)
         lock.mutex.release()
 
 @contextmanager
-def media_write_lock(video_path: str, job_id: int | None = None, *,
+def media_write_lock(video_path: str, *, job_id: int | None = None,
                      blocking: bool = True) -> Iterator[MediaWriteState]:
     """Serialize writers; nonblocking acquisition refuses live owners before changing state."""
     canonical = _canonical_path(video_path)

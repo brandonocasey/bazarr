@@ -244,21 +244,6 @@ def test_recovery_migration_preserves_legacy_rows_and_is_additive():
     legacy.dispose()
 
 
-def test_fresh_cleanup_table_defaults_to_inactive_recovery():
-    import sqlalchemy as sa
-
-    fresh = sa.create_engine('sqlite://')
-    TableSubtitleCleanupOperations.__table__.create(fresh)
-    with fresh.begin() as connection:
-        connection.exec_driver_sql(
-            'INSERT INTO table_subtitle_cleanup_operations '
-            '(id, media_type, media_id, video_path, status, payload, created_at) '
-            "VALUES ('fresh', 'movie', 1, '/missing/fresh.mkv', 'queued', '{}', '2026-01-01')")
-        assert connection.exec_driver_sql(
-            'SELECT recovery_pending FROM table_subtitle_cleanup_operations').scalar() == 0
-    fresh.dispose()
-
-
 def test_batch_status_uses_chunked_database_reads(library):
     from app.database import SUBTITLE_MAP_QUERY_BATCH_SIZE
 

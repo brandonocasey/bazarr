@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
+from pathlib import Path
 from threading import Event, Thread
 
 import pytest
@@ -178,3 +179,89 @@ def test_recovery_refresh_preserves_later_claim(library, monkeypatch, claim):
         assert current['status'] == 'complete' and current['job_id'] == -123
         assert store.list_operations('movie', completed['media_id'])[0]['job_id'] == -123
         assert store.recovery_operations(str(video)) == []
+
+
+@pytest.mark.parametrize('entrypoint', ['single', 'batch', 'restart'])
+@pytest.mark.parametrize('captured_staging', [False, True])
+def test_deleted_restore_preserves_explanation_and_retires_only_settled_recovery(
+        library, entrypoint, captured_staging):
+    client, headers, _, video, aligned, lower = library
+    completed = _apply(library, _preview(library))
+    cleaned = {path: path.read_bytes() for path in (video, aligned, lower) if path.exists()}
+    response = client.post(f'/api/subtitles/cleanup/{completed["id"]}/restore', headers=headers,
+                           json={'preview_token': completed['preview_token']})
+    assert response.status_code == 202, response.json
+    restoring = response.json
+    staging = None
+    if captured_staging:
+        staging = Path(completed['backup_path']).parents[2] / 'cache' / 'subtitle-cleanup' / completed['id'] / 'captured'
+        staging.mkdir(parents=True)
+        (staging / 'unresolved-output').write_bytes(b'retain captured staging')
+        info = staging.stat()
+        restoring['staging_workspace'] = {'path': str(staging), 'device': info.st_dev, 'inode': info.st_ino}
+        store.update_operation(restoring)
+    response = client.delete('/api/system/jobs', headers=headers, data={'id': restoring['job_id']})
+    assert response.status_code == 204, response.json
+    assert not any(job.job_id == restoring['job_id'] for job in jobs_queue.jobs_pending_queue)
+    if entrypoint == 'restart':
+        service.recover_interrupted_operations()
+    elif entrypoint == 'batch':
+        response = client.post('/api/subtitles/cleanup/status', headers=headers,
+                               json={'operation_ids': [completed['id']]})
+        assert response.status_code == 200, response.json
+    else:
+        response = client.get(f'/api/subtitles/cleanup/{completed["id"]}', headers=headers)
+        assert response.status_code == 200, response.json
+    interrupted = store.get_operation(completed['id'])
+    assert interrupted['status'] == 'complete'
+    assert 'confirm restoration again' in interrupted['error']
+    assert database.scalar(select(TableSubtitleCleanupOperations.recovery_pending).where(
+        TableSubtitleCleanupOperations.id == completed['id'])) is captured_staging
+    if captured_staging:
+        assert (staging / 'unresolved-output').read_bytes() == b'retain captured staging'
+        assert interrupted['staging_workspace'] == restoring['staging_workspace']
+    else:
+        for _ in range(2):
+            with media_write_lock(str(video)):
+                pass
+            assert store.get_operation(completed['id'])['error'] == interrupted['error']
+            assert store.recovery_operations(str(video)) == []
+    assert {path: path.read_bytes() for path in cleaned} == cleaned
+    assert not lower.exists()
+    journal = transactions.read_journal(Path(completed['backup_path']))
+    assert journal['phase'] == 'complete'
+    assert all(Path(entry['backup']).exists() for entry in journal['entries'])
+
+
+def test_status_snapshot_cannot_discard_apply_queued_after_snapshot(library, monkeypatch):
+    client, headers, _, video, aligned, lower = library
+    preview = _preview(library)
+    snapshot_jobs = jobs_queue.snapshot_jobs
+    requests = []
+
+    def snapshot_then_apply():
+        snapshot = snapshot_jobs()
+        if not requests:
+            keepers = {group['key']: group['recommended_keeper'] for group in preview['groups']}
+            response = client.post(f'/api/subtitles/cleanup/{preview["id"]}/apply', headers=headers,
+                                   json={'preview_token': preview['preview_token'], 'keepers': keepers})
+            requests.append((response.status_code, response.json))
+        return snapshot
+
+    monkeypatch.setattr(jobs_queue, 'snapshot_jobs', snapshot_then_apply)
+    response = client.get(f'/api/subtitles/cleanup/{preview["id"]}', headers=headers)
+    assert response.status_code == 200, response.json
+    assert requests[0][0] == 202, requests
+    applying = store.get_operation(preview['id'])
+    assert applying['status'] == 'applying', applying
+    assert applying['job_id'] == requests[0][1]['job_id']
+    job = next(job for job in jobs_queue.jobs_pending_queue if job.job_id == applying['job_id'])
+    assert jobs_queue._run_job(job_instance=job)
+    completed = store.get_operation(preview['id'])
+    assert job.status == 'completed'
+    assert completed['status'] == 'complete', completed
+    assert completed['error'] is None
+    assert video.exists() and aligned.exists() and not lower.exists()
+    journal = transactions.read_journal(Path(completed['backup_path']))
+    assert journal['phase'] == 'complete'
+    assert store.recovery_operations(str(video)) == []

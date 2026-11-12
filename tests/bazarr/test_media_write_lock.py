@@ -921,7 +921,7 @@ def test_canceled_nonblocking_probe_has_no_filesystem_or_recovery_effects(guard,
     guard(lambda path: recovered.append(path))
     video = str(tmp_path / 'Movie.mkv')
     with pytest.raises(JobCanceled):
-        with coordination.media_write_lock(video, 1, blocking=False):
+        with coordination.media_write_lock(video, job_id=1, blocking=False):
             pytest.fail('canceled probe entered')
     assert not (Path(args.config_dir) / 'media_write_locks').exists()
     assert recovered == []

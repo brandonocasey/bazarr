@@ -71,8 +71,9 @@ def preview(media_type: str, media_id: int, audio_stream_index: int | None = Non
 
 
 def get_operation(operation_id: str) -> Operation:
+    operation = store.get_operation(operation_id)
     is_active = partial(_snapshot_job_is_active, jobs=jobs_queue.snapshot_jobs())
-    return _revalidate_inactive_operation(store.get_operation(operation_id), is_active)
+    return _revalidate_inactive_operation(operation, is_active)
 
 
 class OperationStatus(TypedDict):
@@ -123,7 +124,9 @@ def _revalidate_inactive_operation(operation: Operation, is_active: Callable[[Op
         if unchanged and not is_active(current):
             current['status'] = 'complete' if current['status'] == 'restoring' else 'failed'
             current['error'] = 'Cleanup job was canceled or interrupted; create a fresh preview or confirm restoration again'
-            store.update_operation(current)
+            journal = transactions.read_journal(_directory(current)) if current['status'] == 'complete' else None
+            pending = False if _restore_recovery_is_settled(current, journal) else None
+            store.update_operation(current, recovery_pending=pending)
         return current
 
 
@@ -306,14 +309,17 @@ def _record_failure(operation: Operation, error: Exception) -> tuple[Journal | N
     return journal, error
 
 
+def _restore_recovery_is_settled(operation: Operation, journal: Journal | None) -> bool:
+    return operation['status'] == 'complete' and journal is not None and journal['phase'] == 'complete' \
+        and operation.get('staging_workspace') is None
+
+
 def _fail_before_lock(snapshot: store.OperationSnapshot, error: Exception) -> None:
     canceled = isinstance(error, (CancelledError, JobCanceled))
     while True:
         operation = snapshot.operation()
         journal, failure = _record_failure(operation, error)
-        settled_restore = journal is not None and operation['status'] == 'complete' \
-            and operation.get('staging_workspace') is None
-        pending = False if settled_restore else None
+        pending = False if _restore_recovery_is_settled(operation, journal) else None
         if store.update_operation_snapshot(operation, snapshot, recovery_pending=pending):
             break
         current = store.get_operation_snapshot(snapshot.id)
@@ -388,7 +394,9 @@ def _recover_operation(operation: Operation) -> None:
             store.update_operation(current)
         elif current['status'] == 'restoring':
             current.update(status='complete', error='Restore interrupted before changes; confirm restoration again')
-            store.update_operation(current)
+            journal = transactions.read_journal(_directory(current))
+            pending = False if _restore_recovery_is_settled(current, journal) else None
+            store.update_operation(current, recovery_pending=pending)
 
 
 def recover_interrupted_operations() -> None:
