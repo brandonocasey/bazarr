@@ -9,7 +9,7 @@ It contains no feature implementation.
 
 - Include external and embedded subtitles, including tracks without download scores.
 - Compare regular and hearing-impaired subtitles together, retaining the highest-scoring track.
-- Include text and bitmap subtitles, including PGS and multilingual VobSub pairs.
+- Include text and bitmap subtitles, including Presentation Graphic Stream (PGS) and multilingual VobSub pairs.
 - Rewrite video containers when removing embedded tracks, without re-encoding retained streams.
 - Provide episode, movie, and bulk cleanup previews.
 
@@ -96,7 +96,7 @@ Leave originals intact when required preservation cannot be established.
 
 Production execution requires an operator-controlled boundary outside repository and model-editable settings.
 Authentication or an editable feature flag cannot provide that boundary alone.
-Cover API calls, jobs, command-line routes, restoration, alternate invocations, and configurable paths.
+Cover application programming interface (API) calls, jobs, command-line routes, restoration, alternate invocations, and configurable paths.
 The deployment must deny production mutation until that boundary exists.
 Development verification uses disposable media.
 This proposal does not authorize production deployment or changes to existing libraries.
