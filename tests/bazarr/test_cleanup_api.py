@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import sys
 from collections import deque
-from threading import Event, Thread
+from threading import Event, Thread, current_thread
 
 import pytest
 
@@ -291,7 +291,8 @@ def test_failed_queue_publication_cannot_run_an_abandoned_restore(library, monke
     assert _run(client.post(url, headers=headers, json=body).json)['status'] == 'restored'
 
 
-def test_queue_transfer_is_invisible_to_cleanup_polling(library, monkeypatch):
+@pytest.mark.parametrize('action', ['scheduler', 'move_top', 'move_bottom'])
+def test_queue_transfer_is_invisible_to_cleanup_polling(library, monkeypatch, action):
     client, headers, *_ = library
     operation = _preview(library)
     keepers = {group['key']: group['recommended_keeper'] for group in operation['groups']}
@@ -311,7 +312,12 @@ def test_queue_transfer_is_invisible_to_cleanup_polling(library, monkeypatch):
 
     def reserve():
         try:
-            reserved.append(jobs_queue._reserve_next_runnable_job())
+            if action == 'scheduler':
+                reserved.append(jobs_queue._reserve_next_runnable_job())
+            else:
+                with client.application.test_client() as other:
+                    reserved.append(other.post('/api/system/jobs', headers=headers,
+                                               data={'id': response.json['job_id'], 'action': action}).status_code)
         except Exception as error:
             errors.append(error)
 
@@ -344,9 +350,61 @@ def test_queue_transfer_is_invisible_to_cleanup_polling(library, monkeypatch):
     assert not errors
     assert not scheduler.is_alive() and not poll.is_alive()
     assert reserved and reserved[0] is not None
-    jobs_queue._run_job(job_instance=reserved[0], reserved=True)
+    if action == 'scheduler':
+        jobs_queue._run_job(job_instance=reserved[0], reserved=True)
+    else:
+        assert reserved == [204]
+        _run(store.get_operation(operation['id']))
     assert not read_during_transfer
     assert observed == ['applying']
+    assert store.get_operation(operation['id'])['status'] == 'complete'
+
+
+def test_force_start_never_disappears_from_cleanup_job_inventory(library, monkeypatch):
+    client, headers, *_ = library
+    operation = _preview(library)
+    keepers = {group['key']: group['recommended_keeper'] for group in operation['groups']}
+    response = client.post(f'/api/subtitles/cleanup/{operation["id"]}/apply', headers=headers,
+                           json={'preview_token': operation['preview_token'], 'keepers': keepers})
+    assert response.status_code == 202
+    released, resume = Event(), Event()
+    real_lock = jobs_queue._queue_lock
+    statuses, errors = [], []
+
+    class PauseAfterUnlock:
+        paused = False
+
+        def __enter__(self):
+            real_lock.acquire()
+            return self
+
+        def __exit__(self, *exception):
+            real_lock.release()
+            if current_thread() is starter and not self.paused:
+                self.paused = True
+                released.set()
+                assert resume.wait(5)
+
+    def force_start():
+        try:
+            with client.application.test_client() as other:
+                statuses.append(other.post('/api/system/jobs', headers=headers,
+                                           data={'id': response.json['job_id'], 'action': 'force_start'}).status_code)
+        except Exception as error:
+            errors.append(error)
+
+    monkeypatch.setattr(jobs_queue, '_queue_lock', PauseAfterUnlock())
+    starter = Thread(target=force_start)
+    starter.start()
+    try:
+        assert released.wait(5)
+        observed = client.get(f'/api/subtitles/cleanup/{operation["id"]}', headers=headers).json['status']
+    finally:
+        resume.set()
+        starter.join(10)
+    assert not starter.is_alive() and not errors
+    assert statuses == [204]
+    assert observed == 'applying'
     assert store.get_operation(operation['id'])['status'] == 'complete'
 
 
