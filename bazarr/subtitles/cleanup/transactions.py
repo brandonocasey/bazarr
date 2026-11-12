@@ -9,6 +9,7 @@ import stat
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 from .models import PreparedFile
 from .records import FileRecord, Journal, JournalEntry
@@ -103,7 +104,8 @@ def _validate_journal_header(journal: Journal, path: Path) -> None:
         raise ValueError(f'Invalid cleanup journal: {path}')
 
 
-def _verified_copy(source: str, target: Path, expected: FileIdentity) -> None:
+def _verified_copy(source: str, target: Path, expected: FileIdentity,
+                   created: Callable[[os.stat_result], None] | None = None) -> None:
     if target.exists() or target.is_symlink():
         raise ValueError(f'Cleanup output already exists: {target}')
     _ensure_directory(target.parent)
@@ -111,6 +113,11 @@ def _verified_copy(source: str, target: Path, expected: FileIdentity) -> None:
     try:
         with open(source, 'rb') as reader, target.open('xb') as writer:
             created_inode = os.fstat(writer.fileno()).st_ino
+            if created is not None:
+                # Persist ownership before copying bytes so recovery can discard interrupted output.
+                os.fsync(writer.fileno())
+                _sync_directory(target.parent)
+                created(os.fstat(writer.fileno()))
             shutil.copyfileobj(reader, writer)
             writer.flush()
             os.fsync(writer.fileno())
@@ -176,7 +183,8 @@ def _prepare_entries(directory: Path, changes: list[PreparedFile], identities: l
             'backup': str(directory / 'originals' / relative),
             'temporary': str(Path(original.path).with_name(f'.bazarr-cleanup-{directory.name}-{index}.stage')),
             'replacement': FileRecord(**asdict(replacement)) if replacement else None,
-            'source': change.staged_path, 'applied': False, 'after': None, 'temporary_created': False,
+            'source': change.staged_path, 'applied': False, 'after': None,
+            'temporary_owner': None, 'temporary_ready': False, 'temporary_content': None,
         })
     if len({entry['path'] for entry in entries}) != len(entries):
         raise ValueError('Cleanup proposed more than one change to the same file')
@@ -219,14 +227,29 @@ def _stage_entries(directory: Path, journal: Journal) -> None:
         verify_identity(original)
         _verified_copy(entry['path'], Path(entry['backup']), original)
         if entry['replacement']:
-            source = entry['source']
-            if source is None:
-                raise ValueError('Cleanup replacement has no staged source')
-            _verified_copy(source, Path(entry['temporary']), FileIdentity(**entry['replacement']))
-            entry['temporary_created'] = True
-            _write_journal(directory, journal)
-            _copy_identity_metadata(Path(entry['temporary']), original)
+            _copy_staged(entry, journal, directory)
         _write_journal(directory, journal)
+
+
+def _copy_staged(entry: JournalEntry, journal: Journal, directory: Path) -> None:
+    restoring = journal['phase'] in ('restoring', 'rolling_back')
+    expected = entry['original'] if restoring else entry['replacement']
+    source = entry['backup'] if restoring else entry['source']
+    if expected is None or source is None:
+        raise ValueError('Cleanup replacement has no staged source or identity')
+    if restoring:
+        entry['temporary'] = str(Path(entry['path']).with_name(f'.bazarr-cleanup-{uuid4()}.stage'))
+    entry.update(temporary_owner=None, temporary_ready=False, temporary_content=expected)
+    _write_journal(directory, journal)
+
+    def remember_owner(info: os.stat_result) -> None:
+        entry['temporary_owner'] = {'device': info.st_dev, 'inode': info.st_ino}
+        _write_journal(directory, journal)
+
+    _verified_copy(source, Path(entry['temporary']), FileIdentity(**expected), remember_owner)
+    _copy_identity_metadata(Path(entry['temporary']), FileIdentity(**entry['original']))
+    entry['temporary_ready'] = True
+    _write_journal(directory, journal)
 
 
 def _replace_entry(entry: JournalEntry) -> None:
@@ -240,22 +263,22 @@ def _replace_entry(entry: JournalEntry) -> None:
 def _remove_temporaries(journal: Journal) -> None:
     for entry in journal['entries']:
         temporary = Path(entry['temporary'])
-        if entry.get('temporary_created') and os.path.lexists(temporary):
-            if temporary.is_symlink():
-                raise ValueError(f'Cleanup temporary file was replaced by a symlink: {temporary}')
-            if not _same_content(str(temporary), entry['replacement']):
+        owner = entry['temporary_owner']
+        if owner is not None and os.path.lexists(temporary):
+            info = temporary.lstat()
+            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (owner['device'], owner['inode']):
+                raise ValueError(f'Cleanup temporary file was replaced: {temporary}')
+            if entry['temporary_ready'] and not _same_content(str(temporary), entry['temporary_content']):
                 raise ValueError(f'Cleanup temporary file changed: {temporary}')
             temporary.unlink()
             _sync_directory(temporary.parent)
 
 
-def _restore_original(entry: JournalEntry) -> None:
+def _restore_original(entry: JournalEntry, journal: Journal, directory: Path) -> None:
     if _same_content(entry['path'], entry['original']):
         return
-    temporary = Path(entry['temporary'])
-    _verified_copy(entry['backup'], temporary, FileIdentity(**entry['original']))
-    _copy_identity_metadata(temporary, FileIdentity(**entry['original']))
-    os.replace(temporary, entry['path'])
+    _copy_staged(entry, journal, directory)
+    os.replace(entry['temporary'], entry['path'])
     _sync_directory(Path(entry['path']).parent)
 
 
@@ -302,7 +325,7 @@ def recover_transaction(directory: Path) -> Journal:
         journal['phase'] = 'rolling_back'
         _write_journal(directory, journal)
     for entry in reversed(journal['entries']):
-        _restore_original(entry)
+        _restore_original(entry, journal, directory)
         _write_journal(directory, journal)
     journal['phase'] = 'restored' if phase == 'restoring' else 'rolled_back'
     _write_journal(directory, journal)

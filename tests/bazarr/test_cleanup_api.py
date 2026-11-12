@@ -2,6 +2,7 @@ import hashlib
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -139,6 +140,7 @@ def test_real_api_cleanup_and_restore_preserve_sources_and_inventory(library):
     assert operation['backup_path']
     completed = _apply(library, operation)
     assert completed['status'] == 'complete', completed['error']
+    assert not list((video.parent / 'app-state' / 'cache' / 'subtitle-cleanup').rglob('prepared-*'))
     assert _sha(aligned) == before[aligned]
     assert not lower.exists()
     assert _sha(video) != before[video]
@@ -209,6 +211,79 @@ def test_removed_pending_job_does_not_leave_operation_polling_forever(library):
     response = client.get(f'/api/subtitles/cleanup/{operation["id"]}', headers=headers)
     assert response.json['status'] == 'failed'
     assert 'canceled or interrupted' in response.json['error']
+
+
+@pytest.mark.parametrize('transition', ['apply', 'restore'])
+def test_polling_during_job_handoff_cannot_cancel_confirmed_work(library, monkeypatch, transition):
+    client, headers, *_ = library
+    operation = _preview(library)
+    if transition == 'restore':
+        operation = _apply(library, operation)
+        assert operation['status'] == 'complete'
+    feed = jobs_queue.feed_jobs_pending_queue
+    observed = []
+
+    def poll_before_enqueuing(*args, **kwargs):
+        response = client.get(f'/api/subtitles/cleanup/{operation["id"]}', headers=headers)
+        observed.append(response.json['status'])
+        return feed(*args, **kwargs)
+
+    monkeypatch.setattr(jobs_queue, 'feed_jobs_pending_queue', poll_before_enqueuing)
+    if transition == 'apply':
+        completed = _apply(library, operation)
+    else:
+        response = client.post(f'/api/subtitles/cleanup/{operation["id"]}/restore', headers=headers,
+                               json={'preview_token': operation['preview_token']})
+        completed = _run(response.json)
+    assert observed == ['applying' if transition == 'apply' else 'restoring']
+    assert completed['status'] == ('complete' if transition == 'apply' else 'restored'), completed['error']
+
+
+@pytest.mark.parametrize('replaced_directory', [False, True])
+def test_restart_removes_only_owned_prepared_outputs_after_process_death(library, replaced_directory):
+    from tests.bazarr.test_cleanup_transactions import _CHILD_BOOTSTRAP
+
+    client, headers, _, video, aligned, lower = library
+    operation = _preview(library)
+    before = {path: _sha(path) for path in (video, aligned, lower)}
+    keepers = {group['key']: group['recommended_keeper'] for group in operation['groups']}
+    response = client.post(f'/api/subtitles/cleanup/{operation["id"]}/apply', headers=headers,
+                           json={'preview_token': operation['preview_token'], 'keepers': keepers})
+    assert response.status_code == 202
+    config = video.parent / 'app-state'
+    script = _CHILD_BOOTSTRAP + '''
+from app.get_args import args
+from subtitles.cleanup import media,service
+args.config_dir=sys.argv[2]
+prepare=media.prepare_outputs
+def crash_after_prepare(*args,**kwargs):
+    prepare(*args,**kwargs);os._exit(25)
+media.prepare_outputs=crash_after_prepare
+service.run_apply(sys.argv[1])
+'''
+    child = subprocess.run([sys.executable, '-c', script, operation['id'], str(config)],
+                           timeout=60, capture_output=True, text=True)
+    assert child.returncode == 25, child.stderr
+    interrupted = store.get_operation(operation['id'])
+    workspace = Path(interrupted['staging_workspace']['path'])
+    assert workspace.is_dir() and list(workspace.rglob('prepared-*'))
+    if replaced_directory:
+        workspace.rename(workspace.with_name('captured-output-moved'))
+        workspace.mkdir()
+        (workspace / 'later.txt').write_text('Later data must survive')
+    decoy = workspace.parent / 'apply-unrelated'
+    decoy.mkdir()
+    (decoy / 'keep.txt').write_text('Unrelated output')
+    assert jobs_queue.remove_job_from_pending_queue(response.json['job_id'])
+    service.recover_interrupted_operations()
+    assert store.get_operation(operation['id'])['status'] == 'failed'
+    if replaced_directory:
+        assert (workspace / 'later.txt').read_text() == 'Later data must survive'
+        assert 'identity changed' in store.get_operation(operation['id'])['error']
+    else:
+        assert not workspace.exists()
+    assert (decoy / 'keep.txt').read_text() == 'Unrelated output'
+    assert {path: _sha(path) for path in before} == before
 
 
 def test_unindexed_bitmap_ties_unscored_and_forced_languages_need_exact_choices(library, media):

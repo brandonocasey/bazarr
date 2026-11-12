@@ -16,6 +16,15 @@ class FileRecord(TypedDict):
     gid: int
 
 
+class StagingOwner(TypedDict):
+    device: int
+    inode: int
+
+
+class WorkspaceRecord(StagingOwner):
+    path: str
+
+
 class JournalEntry(TypedDict):
     path: str
     original: FileRecord
@@ -25,7 +34,9 @@ class JournalEntry(TypedDict):
     source: str | None
     applied: bool
     after: FileRecord | None
-    temporary_created: bool
+    temporary_owner: StagingOwner | None
+    temporary_ready: bool
+    temporary_content: FileRecord | None
 
 
 class Journal(TypedDict):
@@ -69,7 +80,11 @@ class OperationExtras(TypedDict):
     selected_keepers: list[str]
 
 
-class Operation(OperationExtras):
+class WorkspaceExtras(TypedDict, total=False):
+    staging_workspace: WorkspaceRecord | None
+
+
+class Operation(OperationExtras, WorkspaceExtras):
     id: str
     status: str
     media_type: str

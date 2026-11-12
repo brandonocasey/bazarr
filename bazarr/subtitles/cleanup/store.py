@@ -89,27 +89,89 @@ def _verify_owner_rows(rows: Sequence[Row[tuple[str]]], video_path: str, forward
             raise CleanupError('Subtitle is also indexed for another video; refusing shared-file cleanup', 409)
 
 
-def _sidecar_files(video: Path) -> list[Path]:
-    from app.config import settings
-    from utilities.helper import get_subtitle_destination_folder
-    from subliminal_patch.core import SUBTITLE_EXTENSIONS
-
+def _subtitle_locations(video: Path, custom: Path | None) -> set[Path]:
     locations = {video.parent}
-    custom = get_subtitle_destination_folder()
-    if custom and settings.general.subfolder == 'absolute':
-        locations.add(Path(custom))
-    elif custom and settings.general.subfolder == 'relative':
+    if custom is not None:
         locations.add(video.parent / custom)
+    return locations
+
+
+def _video_paths() -> list[Path]:
+    videos: list[Path] = []
+    for table, mapper in ((TableMovies, path_mappings.path_replace_movie),
+                          (TableEpisodes, path_mappings.path_replace)):
+        rows = database.execute(select(table.path).where(table.path.is_not(None))).all()
+        videos.extend(Path(mapper(row.path)) for row in rows if row.path)
+    return videos
+
+
+def _index_video_owners(videos: list[Path], custom: Path | None) -> dict[Path, dict[str, set[str]]]:
+    owners: dict[Path, dict[str, set[str]]] = {}
+    directories: dict[Path, Path] = {}
+    for video in videos:
+        if video.parent not in directories:
+            directories[video.parent] = Path(os.path.normcase(os.path.realpath(video.parent)))
+        parent = directories[video.parent]
+        identity = os.path.normcase(str(parent / video.name))
+        for directory in _subtitle_locations(video, custom):
+            if directory not in directories:
+                directories[directory] = Path(os.path.normcase(os.path.realpath(directory)))
+            names = owners.setdefault(directories[directory], {})
+            names.setdefault(video.stem.casefold(), set()).add(identity)
+    return owners
+
+
+def _candidate_owners(path: Path, names: dict[str, set[str]]) -> set[str]:
+    stem = path.stem.casefold()
+    owners: set[str] = set()
+    while stem:
+        owners.update(names.get(stem, ()))
+        stem, separator, _ = stem.rpartition('.')
+        if not separator:
+            break
+    return owners
+
+
+def _scan_subtitle_locations(locations: set[Path]) -> tuple[list[Path], list[Path]]:
+    from subliminal_patch.core import SUBTITLE_EXTENSIONS
+    from subliminal.video import VIDEO_EXTENSIONS
+
     extensions = {*SUBTITLE_EXTENSIONS, '.idx', '.sup', '.scc', '.ttml', '.dfxp'}
-    prefix = os.path.normcase(video.stem)
-    found = []
+    videos = []
+    candidates = []
     for directory in locations:
         if not directory.is_dir():
             continue
         for path in directory.iterdir():
-            stem = os.path.normcase(path.stem)
-            if path.is_file() and path.suffix.lower() in extensions and (stem == prefix or stem.startswith(prefix + '.')):
-                found.append(path)
+            if not path.is_file():
+                continue
+            if path.suffix.lower() in VIDEO_EXTENSIONS:
+                videos.append(path)
+            if path.suffix.lower() in extensions:
+                candidates.append(path)
+    return videos, candidates
+
+
+def _sidecar_files(video: Path) -> list[Path]:
+    from app.config import settings
+    from utilities.helper import get_subtitle_destination_folder
+
+    destination = get_subtitle_destination_folder()
+    custom = Path(destination) if destination and settings.general.subfolder in ('absolute', 'relative') else None
+    if custom is not None and settings.general.subfolder == 'absolute':
+        custom = custom.absolute()
+    locations = {Path(os.path.normcase(os.path.realpath(path))) for path in _subtitle_locations(video, custom)}
+    videos, candidates = _scan_subtitle_locations(locations)
+    owners = _index_video_owners([video, *_video_paths(), *videos], custom)
+    identity = os.path.normcase(str(video))
+    found = []
+    for path in candidates:
+        matches = _candidate_owners(path, owners[path.parent])
+        if identity not in matches:
+            continue
+        if len(matches) != 1:
+            raise CleanupError(f'Subtitle has ambiguous video owners; move it to a unique subtitle location: {path}', 409)
+        found.append(path)
     return found
 
 
@@ -186,10 +248,13 @@ def list_operations(media_type: str, media_id: int) -> list[Operation]:
     return [json.loads(row.payload) for row in rows]
 
 
-def update_operation(operation: Operation, previous: tuple[str, ...] | None = None) -> Operation:
+def update_operation(operation: Operation, previous: tuple[str, ...] | None = None, *, reset_job: bool = False) -> Operation:
     statement = update(TableSubtitleCleanupOperations).where(TableSubtitleCleanupOperations.id == operation['id'])
     if previous is not None:
         statement = statement.where(TableSubtitleCleanupOperations.status.in_(previous))
+    if reset_job:
+        operation['job_id'] = None
+        statement = statement.values(job_id=None)
     result = database.execute(statement.values(status=operation['status'], payload=json.dumps(operation, allow_nan=False))
                               .returning(TableSubtitleCleanupOperations.id)).scalar_one_or_none()
     if result != operation['id']:

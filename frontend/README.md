@@ -103,6 +103,9 @@ This command will be automatically triggered before any commits to git. Run manu
 
 ## Subtitle cleanup
 
+Install FFmpeg and MKVToolNix on Bazarr's host before using cleanup.
+Make `ffmpeg`, `ffprobe`, `mkvmerge`, `mkvextract`, and `mkvpropedit` available on its `PATH`.
+
 Use **Cleanup subtitles** on a series episode page.
 On movies, choose **Cleanup redundant subtitles...** from More Actions or the subtitle menu.
 Movie Select mode also offers cleanup.

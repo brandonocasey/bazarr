@@ -10,6 +10,17 @@ import pytest
 from subtitles.cleanup import transactions
 
 
+_CHILD_BOOTSTRAP = '''
+import os, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0,str(Path.cwd()/'bazarr'))
+os.environ['NO_CLI']='true'
+import bazarr.app.libs
+from subtitles.cleanup import transactions
+'''
+
+
 def _inputs(tmp_path):
     video = tmp_path / 'A movie #2.mkv'
     subtitle = tmp_path / 'A movie #2.eng.srt'
@@ -74,14 +85,7 @@ def test_replacement_failure_rolls_back_prior_file(tmp_path, monkeypatch):
 def test_process_crash_between_replacement_and_journal_recovers(tmp_path):
     video, subtitle, _, _, _ = _inputs(tmp_path)
     directory = tmp_path / 'backup'
-    script = '''
-import os, sys
-from pathlib import Path
-from types import SimpleNamespace
-sys.path.insert(0,str(Path.cwd()/'bazarr'))
-os.environ['NO_CLI']='true'
-import bazarr.app.libs
-from subtitles.cleanup import transactions
+    script = _CHILD_BOOTSTRAP + '''
 root=Path(sys.argv[1]);video=root/'A movie #2.mkv';sub=root/'A movie #2.eng.srt'
 changes=[SimpleNamespace(original_path=str(video),staged_path=str(root/'new.mkv')),
          SimpleNamespace(original_path=str(sub),staged_path=None)]
@@ -172,3 +176,45 @@ def test_restore_crash_finishes_from_durable_journal(tmp_path):
     assert transactions.recover_transaction(directory)['phase'] == 'restored'
     assert video.read_bytes() == b'original video and both subtitle streams'
     assert subtitle.read_bytes() == b'lower ranked subtitles'
+
+
+@pytest.mark.parametrize('phase,filename', [('apply', 'video'), ('restore', 'video'), ('restore', 'subtitle')])
+def test_copy_crash_recovers_owned_staging_and_preserves_decoys(tmp_path, phase, filename):
+    video, subtitle, _, identities, changes = _inputs(tmp_path)
+    directory = tmp_path / 'backup'
+    if phase == 'restore':
+        transactions.commit_changes(directory, changes, identities, lambda: None)
+    decoy = tmp_path / '.bazarr-cleanup-other-operation.stage'
+    decoy.write_bytes(b'Unrelated staging output')
+    script = _CHILD_BOOTSTRAP + '''
+import shutil
+root=Path(sys.argv[1]);phase=sys.argv[2];filename=sys.argv[3]
+video=root/'A movie #2.mkv';sub=root/'A movie #2.eng.srt'
+source = str(root/'new.mkv')
+if phase=='restore':
+    journal=transactions.read_journal(root/'backup')
+    original=video if filename=='video' else sub
+    source=next(entry['backup'] for entry in journal['entries'] if entry['path']==str(original))
+copy=shutil.copyfileobj
+def crash_during_copy(reader,writer,*args,**kwargs):
+    if str(reader.name)==source:
+        writer.write(reader.read(8));writer.flush();os.fsync(writer.fileno());os._exit(24)
+    return copy(reader,writer,*args,**kwargs)
+shutil.copyfileobj=crash_during_copy
+if phase=='restore':
+    transactions.restore_transaction(root/'backup')
+else:
+    changes=[SimpleNamespace(original_path=str(video),staged_path=str(root/'new.mkv')),
+             SimpleNamespace(original_path=str(sub),staged_path=None)]
+    identities=[transactions.fingerprint(str(p)) for p in (video,sub)]
+    transactions.commit_changes(root/'backup',changes,identities,lambda:None)
+'''
+    result = subprocess.run([sys.executable, '-c', script, str(tmp_path), phase, filename],
+                            timeout=30, capture_output=True, text=True)
+    assert result.returncode == 24, result.stderr
+    recovered = transactions.recover_transaction(directory)
+    assert recovered['phase'] == ('restored' if phase == 'restore' else 'rolled_back')
+    assert video.read_bytes() == b'original video and both subtitle streams'
+    assert subtitle.read_bytes() == b'lower ranked subtitles'
+    assert list(tmp_path.glob('.bazarr-cleanup-*.stage')) == [decoy]
+    assert decoy.read_bytes() == b'Unrelated staging output'
