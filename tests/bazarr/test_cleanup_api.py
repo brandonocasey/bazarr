@@ -130,7 +130,7 @@ def test_completed_journal_recovery_invalidates_unchanged_file_selection(library
     _, _, _, video, aligned, lower = library
     completed = _apply(library, _preview(library))
     completed['status'] = 'failed'
-    store.update_operation(completed)
+    store.update_operation(completed, recovery_pending=True)
     before = _sha(video)
     selection = media_write_state(str(video))
     with media_write_lock(str(video)) as recovered:
@@ -159,7 +159,7 @@ def test_rolled_back_journal_allows_fresh_extraction_retries(library, monkeypatc
                                      [transactions.fingerprint(str(lower))], cancel)
     assert transactions.read_journal(directory)['phase'] == 'rolled_back'
     operation['status'] = 'failed'
-    store.update_operation(operation)
+    store.update_operation(operation, recovery_pending=True)
     track = TableMoviesSubtitles(radarrId=media_id, embedded_track_id=2, language='en', forced=False, hi=False)
     database.add(track)
     database.commit()
@@ -261,6 +261,16 @@ def test_restore_refuses_later_download_without_changing_cleaned_video(library):
     assert 'later changes' in refused['error']
     assert _sha(video) == video_hash
     assert lower.read_text() == 'Later download must survive restoration'
+    from utilities.media_write_lock import media_write_lock
+    from subtitles.cleanup import transactions
+
+    for _ in range(2):
+        with media_write_lock(str(video)):
+            pass
+        assert store.get_operation(operation['id'])['error'] == refused['error']
+    assert store.recovery_operations(str(video)) == []
+    journal = transactions.read_journal(Path(completed['backup_path']))
+    assert all(Path(entry['backup']).exists() for entry in journal['entries'])
 
 
 def test_removed_pending_job_does_not_leave_operation_polling_forever(library):
@@ -389,7 +399,7 @@ def test_queue_transfer_is_invisible_to_cleanup_polling(library, monkeypatch, ac
     removed, resume, listing, done = Event(), Event(), Event(), Event()
     reserved, observed, errors = [], [], []
     pending = jobs_queue.jobs_pending_queue
-    list_jobs = jobs_queue.list_jobs_from_queue
+    snapshot_jobs = jobs_queue.snapshot_jobs
 
     class PausedTransfer(deque):
         def remove(self, job):
@@ -418,10 +428,10 @@ def test_queue_transfer_is_invisible_to_cleanup_polling(library, monkeypatch, ac
 
     def signal_listing(*args, **kwargs):
         listing.set()
-        return list_jobs(*args, **kwargs)
+        return snapshot_jobs(*args, **kwargs)
 
     monkeypatch.setattr(jobs_queue, 'jobs_pending_queue', PausedTransfer(pending))
-    monkeypatch.setattr(jobs_queue, 'list_jobs_from_queue', signal_listing)
+    monkeypatch.setattr(jobs_queue, 'snapshot_jobs', signal_listing)
     scheduler, poll = Thread(target=reserve), Thread(target=read)
     scheduler.start()
     try:
@@ -644,3 +654,41 @@ def test_episode_cleanup_restores_inventory_without_touching_movie_decoy(library
         database.execute(delete(TableEpisodes).where(TableEpisodes.sonarrEpisodeId == episode_id))
         database.execute(delete(TableShows).where(TableShows.sonarrSeriesId == episode_id))
         database.commit()
+
+
+def test_canceled_restore_keeps_cancellation_after_later_media_locks(library):
+    from subtitles.cleanup import transactions
+    from utilities.media_write_lock import media_write_lock
+
+    _, _, _, video, *_ = library
+    completed = _apply(library, _preview(library))
+    restoring = service.restore(completed['id'], completed['preview_token'])
+    job = next(job for job in jobs_queue.jobs_pending_queue if job.job_id == restoring['job_id'])
+    job.cancel_event.set()
+    canceled = _run(restoring)
+    assert job.status == 'canceled'
+    assert canceled['status'] == 'complete'
+    assert 'canceled' in canceled['error'].lower()
+    for _ in range(2):
+        with media_write_lock(str(video)):
+            pass
+        assert store.get_operation(completed['id'])['error'] == canceled['error']
+    assert store.recovery_operations(str(video)) == []
+    journal = transactions.read_journal(Path(completed['backup_path']))
+    assert journal['phase'] == 'complete'
+    assert all(Path(entry['backup']).exists() for entry in journal['entries'])
+
+
+def test_canceled_restore_keeps_cancellation_when_journal_needs_attention(library):
+    _, _, _, video, *_ = library
+    completed = _apply(library, _preview(library))
+    restoring = service.restore(completed['id'], completed['preview_token'])
+    job = next(job for job in jobs_queue.jobs_pending_queue if job.job_id == restoring['job_id'])
+    (Path(completed['backup_path']) / 'journal.json').write_text('{')
+    job.cancel_event.set()
+    canceled = _run(restoring)
+    assert job.status == 'canceled'
+    assert canceled['status'] == 'failed'
+    assert 'canceled' in canceled['error'].lower()
+    assert 'journal recovery requires attention' in canceled['error']
+    assert [operation['id'] for operation in store.recovery_operations(str(video))] == [completed['id']]

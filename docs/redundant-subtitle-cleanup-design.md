@@ -21,6 +21,7 @@ The common score measures speech timing, with separate forced-subtitle groups.
 Rank every candidate using the same speech-timing correlation score, from -1 to 1.
 Show existing download-match scores separately.
 Those scores measure [metadata matches](../custom_libs/subliminal_patch/score.py), rather than subtitle content quality.
+
 [Uploads](../bazarr/subtitles/upload.py) and [extractions](../bazarr/subtitles/embedded.py) can record synthetic maximum scores.
 Do not treat these synthetic values as measured quality.
 
@@ -32,6 +33,7 @@ Do not strip hearing-impaired cues from text while retaining their bitmap equiva
 Calculate normalized Pearson correlation between the two signals.
 Record the raw score, audio selection, algorithm settings, and parser/tool versions.
 Do not adjust subtitle timestamps or impose an additional minimum score.
+
 Require a keeper selection when highest scores tie or analysis cannot produce meaningful correlation.
 Constant signals, decoding failures, and incomplete timing data require explicit explanations.
 Never invent a numeric score for those cases.
@@ -59,6 +61,7 @@ Treat `.idx` and `.sub` companions as one unit, potentially containing multiple 
 Use temporary Matroska and [VobSub extraction](https://mkvtoolnix.download/doc/mkvextract.html#mkvextract.output_file_formats)
 to rebuild retained tracks and their companions.
 Combined extraction requires matching codec headers.
+
 Validate retained images, palettes, effective display times, and language indexes.
 Do not delete shared companion data because one contained track loses.
 Unsupported versions or preservation failures must leave originals intact and report the reason.
@@ -67,7 +70,7 @@ Unsupported versions or preservation failures must leave originals intact and re
 
 1. Show every keeper and removal, including language, forced status, and hearing-impaired status.
 2. Explain score limitations, video rewrites, backups, and required space on each filesystem.
-3. Persist the exact preview with media IDs, candidate membership, stream mappings, and content fingerprints.
+3. Persist the exact preview with media identifiers, candidate membership, stream mappings, and content fingerprints.
 4. Fingerprint every candidate, keeper, video, and VobSub companion.
 5. Apply only the confirmed preview; revalidate it immediately before replacement.
 6. Coordinate all Bazarr media writes through shared cross-process locks.
@@ -83,16 +86,29 @@ Unsupported versions or preservation failures must leave originals intact and re
 Queued extraction rechecks its selected subtitle and media file after acquiring the lock.
 Writer versions reject extraction selections overlapping active or interrupted writes, even after reindexing.
 Completed rollbacks permit fresh extraction retries.
-Subtitle IDs identify the current inventory; they do not preserve earlier selections after completed cleanup.
+
+Subtitle identifiers describe the current inventory; they do not preserve earlier selections after completed cleanup.
+Hash preview inputs and analyze subtitles without holding the media writer lock.
+Validate writer versions, file metadata and candidate membership before publishing the preview.
+Apply and restore revalidate full content fingerprints while holding the write lock.
 
 Multiple file replacements are not one atomic operation.
 The journal and recovery protocol must handle partial commits.
+
+Preserve original file ownership and permissions.
+Explain filesystem refusals without relaxing preservation.
+
+After rollback, discard each captured backup only after verifying all originals and that backup.
+Retain completed cleanup backups for restoration.
+Preserve copies without ownership or content proof.
+
 Bazarr locks cannot coordinate independent Sonarr, Radarr, or filesystem writers by themselves.
 Production operation therefore requires coordination with those writers.
 
 Verify explicit input/output stream mappings before replacement.
 Compare audio/video payloads, retained captions, initialization data, and presentation timing.
 Also compare dispositions, metadata, chapters, attachments, and container-specific structures.
+
 Successful tool execution and readable output alone do not prove preservation.
 Leave originals intact when required preservation cannot be established.
 
@@ -102,6 +118,7 @@ Production execution requires an operator-controlled boundary outside repository
 Authentication or an editable feature flag cannot provide that boundary alone.
 Cover application programming interface (API) calls, jobs, command-line routes, restoration, alternate invocations, and configurable paths.
 The deployment must deny production mutation until that boundary exists.
+
 Development verification uses disposable media.
 Development verification does not authorize production deployment or changes to existing libraries.
 
@@ -109,6 +126,11 @@ Development verification does not authorize production deployment or changes to 
 
 The cleanup backend lives under `bazarr/subtitles/cleanup/`.
 Operation records integrate with [the database](../bazarr/app/database.py).
+
+Batch status requests share one job snapshot.
+They preserve independent operation errors.
+Settled recovery records avoid repeated locks, staging cleanup, and database writes.
+
 The [subtitle action menu](../frontend/src/components/SubtitleToolsMenu.tsx)
 and [bulk tools](../frontend/src/components/modals/SubtitleToolsModal.tsx) open the shared preview.
 See [cleanup controls](../frontend/README.md#subtitle-cleanup) for the interface workflow.

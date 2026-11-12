@@ -454,8 +454,9 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
         judge wording, translation, language correctness, completeness or actual
         content redundancy. Each language keeps one track; forced translations
         stay separate. Normal and hearing-impaired (HI) tracks compete, so HI
-        captions can be lost. Unknown and unrankable tracks remain visible and
-        require a choice.
+        captions can be lost. Missing timing scores require a keeper choice.
+        Tracks tagged und (undetermined language) compete by timing score within
+        their groups.
       </Alert>
       <Text>
         Previewing only analyzes files. Cleanup removes external files and
@@ -730,4 +731,5 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
 export default withModal(SubtitleCleanupView, "subtitle-cleanup", {
   title: "Subtitle Cleanup",
   size: "xl",
+  closeButtonProps: { "aria-label": "Close subtitle cleanup" },
 });

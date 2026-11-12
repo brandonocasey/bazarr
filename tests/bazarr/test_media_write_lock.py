@@ -773,3 +773,156 @@ def test_synchronous_processing_uses_current_download_cancellation(queued_proces
         assert state.subtitle.stat().st_mode & 0o777 == 0o640
     assert notifications == [7]
     assert not state.queue.jobs_pending_queue
+
+
+def test_nonblocking_thread_contention_preserves_live_owner(guard, tmp_path):
+    video = str(tmp_path / 'Movie ü; v1.2.mkv')
+    alias = tmp_path / 'alias.mkv'
+    alias.symlink_to(video)
+    entered = threading.Event()
+    release = threading.Event()
+    recovered = []
+    guard(lambda path: recovered.append(path))
+
+    def own():
+        with coordination.media_write_lock(video):
+            entered.set()
+            assert release.wait(10), 'owner was not released'
+
+    def probe():
+        with pytest.raises(BlockingIOError, match='active media writer'):
+            with coordination.media_write_lock(str(alias), blocking=False):
+                pytest.fail('probe entered a live writer')
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(own)
+        try:
+            assert entered.wait(5)
+            live = coordination.media_write_state(video)
+            assert live.active
+            for _ in range(2):
+                pool.submit(probe).result(timeout=1)
+                assert coordination.media_write_state(video) == live
+                assert recovered == [video]
+            with coordination.media_write_lock(str(tmp_path / 'Other' / Path(video).name), blocking=False):
+                pass
+        finally:
+            release.set()
+            owner.result(timeout=5)
+    assert not coordination.media_write_state(video).active
+
+
+@pytest.fixture
+def live_media_writer(guard, tmp_path):
+    from app.get_args import args
+
+    video = str(tmp_path / 'Movie ü; v1.2.mkv')
+    ready = tmp_path / 'writer-ready'
+    script = '''
+import os, sys
+os.environ['NO_CLI'] = 'true'
+import bazarr.app.libs
+from app.get_args import args
+from utilities.media_write_lock import media_write_lock
+from pathlib import Path
+args.config_dir = sys.argv[1]
+with media_write_lock(sys.argv[2]):
+    Path(sys.argv[3]).write_text('locked')
+    sys.stdin.read(1)
+'''
+    environment = dict(os.environ)
+    environment['PYTHONPATH'] = os.pathsep.join((str(Path.cwd()), str(Path.cwd() / 'bazarr')))
+    process = subprocess.Popen([sys.executable, '-c', script, args.config_dir, video, str(ready)],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=environment, text=True)
+    try:
+        _wait_until(lambda: ready.exists() or process.poll() is not None)
+        assert ready.exists(), 'child did not acquire file lock'
+        yield video, process
+    finally:
+        if process.poll() is None:
+            stdout, stderr = process.communicate('x', timeout=5)
+            assert process.returncode == 0, (stdout, stderr)
+        else:
+            process.communicate(timeout=5)
+
+
+def test_nonblocking_process_contention_preserves_kernel_lock(live_media_writer, guard):
+    video, process = live_media_writer
+    recovered = []
+    guard(lambda path: recovered.append(path))
+    live = coordination.media_write_state(video)
+    assert live.active
+
+    def probe():
+        with pytest.raises(BlockingIOError, match='active media writer'):
+            with coordination.media_write_lock(video, blocking=False):
+                pytest.fail('probe entered a live process writer')
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            for _ in range(2):
+                pool.submit(probe).result(timeout=1)
+                assert process.poll() is None
+                assert coordination.media_write_state(video) == live
+                assert recovered == []
+        finally:
+            stdout, stderr = process.communicate('x', timeout=5)
+            assert process.returncode == 0, (stdout, stderr)
+    with coordination.media_write_lock(video, blocking=False):
+        pass
+    assert recovered == [video]
+    assert not coordination.media_write_state(video).active
+
+
+@pytest.mark.parametrize('recovery_fails', [False, True])
+def test_nonblocking_crashed_owner_repairs_state_and_runs_nested_guard(live_media_writer, guard, recovery_fails):
+    video, process = live_media_writer
+    process.kill()
+    process.communicate(timeout=5)
+    stale = coordination.media_write_state(video)
+    assert stale.active
+    recovered = []
+
+    def recover(path):
+        recovered.append(path)
+        with coordination.media_write_lock(path, blocking=False) as nested:
+            assert nested == coordination.media_write_state(path)
+        if recovery_fails and len(recovered) == 1:
+            raise RuntimeError('recovery failed')
+        return True
+
+    guard(recover)
+    if recovery_fails:
+        with pytest.raises(RuntimeError, match='recovery failed'):
+            with coordination.media_write_lock(video, blocking=False):
+                pytest.fail('writer entered before recovery completed')
+    else:
+        with coordination.media_write_lock(video, blocking=False) as previous:
+            assert previous != stale
+            assert not previous.active
+    assert recovered == [video]
+    repaired = coordination.media_write_state(video)
+    assert not repaired.active
+    assert repaired != stale
+    with coordination.media_write_lock(video, blocking=False):
+        pass
+    assert recovered == [video, video]
+
+
+def test_canceled_nonblocking_probe_has_no_filesystem_or_recovery_effects(guard, tmp_path, monkeypatch):
+    from app.get_args import args
+    from app.jobs_queue import jobs_queue, JobCanceled
+
+    canceled = threading.Event()
+    canceled.set()
+    monkeypatch.setattr(jobs_queue, 'get_job', lambda job_id: SimpleNamespace(cancel_event=canceled))
+    recovered = []
+    guard(lambda path: recovered.append(path))
+    video = str(tmp_path / 'Movie.mkv')
+    with pytest.raises(JobCanceled):
+        with coordination.media_write_lock(video, job_id=1, blocking=False):
+            pytest.fail('canceled probe entered')
+    assert not (Path(args.config_dir) / 'media_write_locks').exists()
+    assert recovered == []
+    assert coordination.media_write_state(video) == coordination.MediaWriteState()

@@ -7,7 +7,7 @@ VAD_MODE = 2
 
 
 def display_signal(intervals: Iterable[tuple[float, float]], duration: float) -> list[float]:
-    """Return display occupancy fractions for 10 ms presentation-time bins."""
+    """Return display occupancy fractions for presentation-time bins spanning 10 milliseconds."""
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError('Media duration must be positive and finite')
     count = math.ceil(duration / FRAME_SECONDS)

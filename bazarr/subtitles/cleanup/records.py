@@ -29,6 +29,7 @@ class JournalEntry(TypedDict):
     path: str
     original: FileRecord
     backup: str
+    backup_owner: StagingOwner | None
     temporary: str
     replacement: FileRecord | None
     source: str | None

@@ -64,6 +64,18 @@ class CleanupPreview(Resource):
         return _response(create)
 
 
+@api_ns_subtitle_cleanup.route('subtitles/cleanup/status')
+class CleanupStatus(Resource):
+    @authenticate
+    def post(self):
+        def read():
+            identifiers = _body().get('operation_ids')
+            if not isinstance(identifiers, list) or not all(isinstance(value, str) for value in identifiers):
+                raise store.CleanupError('Operation IDs must be a list of strings')
+            return {'data': service.get_operations(identifiers)}
+        return _response(read)
+
+
 @api_ns_subtitle_cleanup.route('subtitles/cleanup/<string:operation_id>')
 class CleanupOperation(Resource):
     @authenticate

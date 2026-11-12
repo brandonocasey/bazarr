@@ -2,11 +2,12 @@
 
 import json
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
-from collections.abc import Callable, Sequence
-from sqlalchemy.engine import Row
+
+from sqlalchemy.sql.dml import Update
 
 from .records import IndexedSubtitle, MediaMetadata, Operation
 
@@ -14,12 +15,28 @@ from app.database import (database, select, update, TableSubtitleCleanupOperatio
                           TableEpisodes, TableMoviesSubtitles, TableEpisodesSubtitles,
                           TableHistory, TableHistoryMovie, SUBTITLE_MAP_QUERY_BATCH_SIZE)
 from utilities.path_mappings import path_mappings
+from utilities.helper import (SubtitleDirectorySettings, get_subtitle_directory_settings,
+                              get_subtitle_output_directories)
+from utilities.subtitle_ownership import indexed_subtitle_owners
 
 
 class CleanupError(ValueError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+@dataclass(frozen=True)
+class OperationSnapshot:
+    id: str
+    payload: str
+    job_id: int | None
+    recovery_pending: bool
+
+    def operation(self) -> Operation:
+        operation = json.loads(self.payload)
+        operation['job_id'] = self.job_id
+        return operation
 
 
 def _canonical_source(path: str) -> str:
@@ -65,35 +82,8 @@ def indexed_subtitles(media_type: str, media_id: int) -> list[IndexedSubtitle]:
 
 
 def _assert_exclusive_owners(video_path: str, paths: set[str]) -> None:
-    sources = (
-        (TableEpisodes, TableEpisodesSubtitles, 'sonarrEpisodeId',
-         path_mappings.path_replace_reverse, path_mappings.path_replace),
-        (TableMovies, TableMoviesSubtitles, 'radarrId',
-         path_mappings.path_replace_reverse_movie, path_mappings.path_replace_movie),
-    )
-    for media, subtitles, identity, reverse, forward in sources:
-        aliases = set()
-        for path in paths:
-            aliases.update((path, reverse(path)))
-        values = sorted(aliases)
-        for offset in range(0, len(values), SUBTITLE_MAP_QUERY_BATCH_SIZE):
-            rows = database.execute(select(media.path).join(
-                subtitles, getattr(media, identity) == getattr(subtitles, identity))
-                .where(subtitles.path.in_(values[offset:offset + SUBTITLE_MAP_QUERY_BATCH_SIZE]))).all()
-            _verify_owner_rows(rows, video_path, forward)
-
-
-def _verify_owner_rows(rows: Sequence[Row[tuple[str]]], video_path: str, forward: Callable[[str], str]) -> None:
-    for row in rows:
-        if os.path.normcase(os.path.realpath(forward(row.path))) != os.path.normcase(video_path):
-            raise CleanupError('Subtitle is also indexed for another video; refusing shared-file cleanup', 409)
-
-
-def _subtitle_locations(video: Path, custom: Path | None) -> set[Path]:
-    locations = {video.parent}
-    if custom is not None:
-        locations.add(video.parent / custom)
-    return locations
+    if indexed_subtitle_owners(paths) - {os.path.normcase(video_path)}:
+        raise CleanupError('Subtitle is also indexed for another video; refusing shared-file cleanup', 409)
 
 
 def _video_paths() -> list[Path]:
@@ -105,7 +95,8 @@ def _video_paths() -> list[Path]:
     return videos
 
 
-def _index_video_owners(videos: list[Path], custom: Path | None) -> dict[Path, dict[str, set[str]]]:
+def _index_video_owners(videos: list[Path],
+                        configuration: SubtitleDirectorySettings) -> dict[Path, dict[str, set[str]]]:
     owners: dict[Path, dict[str, set[str]]] = {}
     directories: dict[Path, Path] = {}
     for video in videos:
@@ -113,7 +104,7 @@ def _index_video_owners(videos: list[Path], custom: Path | None) -> dict[Path, d
             directories[video.parent] = Path(os.path.normcase(os.path.realpath(video.parent)))
         parent = directories[video.parent]
         identity = os.path.normcase(str(parent / video.name))
-        for directory in _subtitle_locations(video, custom):
+        for directory in get_subtitle_output_directories(str(video), configuration):
             if directory not in directories:
                 directories[directory] = Path(os.path.normcase(os.path.realpath(directory)))
             names = owners.setdefault(directories[directory], {})
@@ -153,16 +144,11 @@ def _scan_subtitle_locations(locations: set[Path]) -> tuple[list[Path], list[Pat
 
 
 def _sidecar_files(video: Path) -> list[Path]:
-    from app.config import settings
-    from utilities.helper import get_subtitle_destination_folder
-
-    destination = get_subtitle_destination_folder()
-    custom = Path(destination) if destination and settings.general.subfolder in ('absolute', 'relative') else None
-    if custom is not None and settings.general.subfolder == 'absolute':
-        custom = custom.absolute()
-    locations = {Path(os.path.normcase(os.path.realpath(path))) for path in _subtitle_locations(video, custom)}
+    configuration = get_subtitle_directory_settings()
+    locations = {Path(os.path.normcase(os.path.realpath(path)))
+                 for path in get_subtitle_output_directories(str(video), configuration)}
     videos, candidates = _scan_subtitle_locations(locations)
-    owners = _index_video_owners([video, *_video_paths(), *videos], custom)
+    owners = _index_video_owners([video, *_video_paths(), *videos], configuration)
     identity = os.path.normcase(str(video))
     found = []
     for path in candidates:
@@ -217,20 +203,39 @@ def create_operation(media_type: str, media_id: int, audio_stream_index: int | N
     database.add(TableSubtitleCleanupOperations(
         id=operation['id'], media_type=media_type, media_id=media_id,
         video_path=os.path.normcase(metadata['video_path']),
-        status='queued', payload=json.dumps(operation), created_at=datetime.now(timezone.utc),
+        status='queued', recovery_pending=False, payload=json.dumps(operation), created_at=datetime.now(timezone.utc),
     ))
     database.commit()
     return operation
 
 
 def get_operation(operation_id: str) -> Operation:
-    row = database.execute(select(TableSubtitleCleanupOperations.payload, TableSubtitleCleanupOperations.job_id)
+    return get_operation_snapshot(operation_id).operation()
+
+
+def get_operation_snapshot(operation_id: str) -> OperationSnapshot:
+    row = database.execute(select(TableSubtitleCleanupOperations.id, TableSubtitleCleanupOperations.payload,
+                                  TableSubtitleCleanupOperations.job_id, TableSubtitleCleanupOperations.recovery_pending)
                            .where(TableSubtitleCleanupOperations.id == operation_id)).first()
     if row is None:
         raise CleanupError('Cleanup operation not found', 404)
-    payload = json.loads(row.payload)
-    payload['job_id'] = row.job_id
-    return payload
+    return OperationSnapshot(row.id, row.payload, row.job_id, row.recovery_pending)
+
+
+def get_operations(operation_ids: list[str]) -> dict[str, Operation | CleanupError]:
+    operations = {}
+    for offset in range(0, len(operation_ids), SUBTITLE_MAP_QUERY_BATCH_SIZE):
+        rows = database.execute(select(TableSubtitleCleanupOperations.id, TableSubtitleCleanupOperations.payload,
+                                       TableSubtitleCleanupOperations.job_id).where(
+            TableSubtitleCleanupOperations.id.in_(operation_ids[offset:offset + SUBTITLE_MAP_QUERY_BATCH_SIZE]))).all()
+        for row in rows:
+            try:
+                operation = json.loads(row.payload)
+                operation['job_id'] = row.job_id
+                operations[row.id] = operation
+            except (TypeError, ValueError) as error:
+                operations[row.id] = CleanupError(str(error), 409)
+    return operations
 
 
 def set_job_id(operation_id: str, job_id: int) -> Operation:
@@ -248,28 +253,58 @@ def list_operations(media_type: str, media_id: int) -> list[Operation]:
     return [json.loads(row.payload) for row in rows]
 
 
-def update_operation(operation: Operation, previous: tuple[str, ...] | None = None, *, reset_job: bool = False) -> Operation:
-    statement = update(TableSubtitleCleanupOperations).where(TableSubtitleCleanupOperations.id == operation['id'])
+def update_operation(operation: Operation, previous: tuple[str, ...] | None = None, *, reset_job: bool = False,
+                     recovery_pending: bool | None = None) -> Operation:
+    if reset_job:
+        operation['job_id'] = None
+    statement = _operation_update(operation, recovery_pending)
     if previous is not None:
         statement = statement.where(TableSubtitleCleanupOperations.status.in_(previous))
     if reset_job:
-        operation['job_id'] = None
         statement = statement.values(job_id=None)
-    result = database.execute(statement.values(status=operation['status'], payload=json.dumps(operation, allow_nan=False))
-                              .returning(TableSubtitleCleanupOperations.id)).scalar_one_or_none()
-    if result != operation['id']:
-        database.rollback()
+    if not _commit_operation(statement, operation['id']):
         raise CleanupError('Cleanup operation changed; reload its current state', 409)
-    database.commit()
     return operation
 
 
+def _operation_update(operation: Operation, recovery_pending: bool | None) -> Update:
+    statement = update(TableSubtitleCleanupOperations).where(TableSubtitleCleanupOperations.id == operation['id'])
+    if recovery_pending is not None:
+        statement = statement.values(recovery_pending=recovery_pending)
+    return statement.values(status=operation['status'], payload=json.dumps(operation, allow_nan=False))
+
+
+def _commit_operation(statement: Update, operation_id: str) -> bool:
+    result = database.execute(statement.returning(TableSubtitleCleanupOperations.id)).scalar_one_or_none()
+    if result != operation_id:
+        database.rollback()
+        return False
+    database.commit()
+    return True
+
+
+def update_operation_snapshot(operation: Operation, snapshot: OperationSnapshot, *,
+                              recovery_pending: bool | None = None) -> bool:
+    statement = _operation_update(operation, recovery_pending).where(
+        TableSubtitleCleanupOperations.id == snapshot.id,
+        TableSubtitleCleanupOperations.payload == snapshot.payload,
+        TableSubtitleCleanupOperations.job_id.is_not_distinct_from(snapshot.job_id),
+        TableSubtitleCleanupOperations.recovery_pending == snapshot.recovery_pending,
+    )
+    return _commit_operation(statement, operation['id'])
+
+
 def recovery_operations(video_path: str) -> list[Operation]:
-    rows = database.execute(select(TableSubtitleCleanupOperations.payload)
+    return [snapshot.operation() for snapshot in recovery_snapshots(video_path)]
+
+
+def recovery_snapshots(video_path: str) -> list[OperationSnapshot]:
+    rows = database.execute(select(TableSubtitleCleanupOperations.id, TableSubtitleCleanupOperations.payload,
+                                   TableSubtitleCleanupOperations.job_id, TableSubtitleCleanupOperations.recovery_pending)
                             .where(TableSubtitleCleanupOperations.video_path == os.path.normcase(video_path),
-                                   TableSubtitleCleanupOperations.status.in_(('applying', 'restoring', 'failed')))
+                                   TableSubtitleCleanupOperations.recovery_pending.is_(True))
                             .order_by(TableSubtitleCleanupOperations.created_at)).all()
-    return [json.loads(row.payload) for row in rows]
+    return [OperationSnapshot(row.id, row.payload, row.job_id, row.recovery_pending) for row in rows]
 
 
 def refresh_inventory(operation: Operation) -> None:

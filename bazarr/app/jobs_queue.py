@@ -59,7 +59,7 @@ class Job:
     :ivar is_cancellable: Indicates whether the job is cancellable, defaults to False.
     :type is_cancellable: bool
     :ivar duration: Indicates how long the job was executed in seconds, initialized to 0.
-    :type duration: int
+    :type duration: float
     :ivar cancel_event: Event to cancel this job, initialized to None.
     :type cancel_event: Event
     """
@@ -81,7 +81,7 @@ class Job:
         self.job_returned_value = job_returned_value
         self.is_cancellable = is_cancellable
         self.cancel_event = Event()
-        self.duration = 0
+        self.duration: float = 0
 
     def __eq__(self, other):
         """
@@ -594,6 +594,13 @@ class JobsQueue:
                 job.cancel_event.set()
                 logging.debug(f"Cancellation requested for job {job.job_name} ({job.job_id})")
         return False
+
+    def snapshot_jobs(self) -> dict[int, Job]:
+        """Index live job references under the queue transfer lock."""
+        with self._queue_lock:
+            queues = (self.jobs_pending_queue, self.jobs_running_queue, self.jobs_failed_queue,
+                      self.jobs_canceled_queue, self.jobs_completed_queue)
+            return {job.job_id: job for queue in queues for job in queue}
 
     def get_job(self, job_id: int | None) -> Job | None:
         """

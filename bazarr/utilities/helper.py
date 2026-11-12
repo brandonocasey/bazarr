@@ -4,6 +4,8 @@ import os
 import logging
 import hashlib
 import hmac
+from dataclasses import dataclass
+from pathlib import Path
 from flask import Request
 
 from charset_normalizer import detect
@@ -52,7 +54,19 @@ def check_credentials(user: str, pw: str, request: Request, log_success: bool = 
         return False
 
 
-def get_subtitle_destination_folder() -> str | None:
+@dataclass(frozen=True)
+class SubtitleDirectorySettings:
+    mode: str
+    custom: str | None
+
+
+def get_subtitle_directory_settings() -> SubtitleDirectorySettings:
+    general = settings.general
+    custom = general.subfolder_custom
+    return SubtitleDirectorySettings(mode=general.subfolder, custom=str(custom).strip() if custom else None)
+
+
+def get_subtitle_destination_folder(configuration: SubtitleDirectorySettings | None = None) -> str | None:
     """
     Determine the custom destination folder configured for subtitle files.
 
@@ -64,9 +78,33 @@ def get_subtitle_destination_folder() -> str | None:
     :return: The stripped custom subfolder path, or ``None`` when no custom
         subfolder is configured or the subfolder mode is ``'current'``.
     """
-    fld_custom = str(settings.general.subfolder_custom).strip() if (settings.general.subfolder_custom and
-                                                                    settings.general.subfolder != 'current') else None
-    return fld_custom
+    if configuration is None:
+        configuration = get_subtitle_directory_settings()
+    return configuration.custom if configuration.mode != 'current' else None
+
+
+def get_subtitle_target_path(file_path: str, configuration: SubtitleDirectorySettings | None = None) -> str | None:
+    """Resolve the configured subtitle target without creating its directory."""
+    if configuration is None:
+        configuration = get_subtitle_directory_settings()
+    custom = get_subtitle_destination_folder(configuration)
+    if not custom:
+        return None
+    if configuration.mode == 'absolute':
+        return force_unicode(custom)
+    if configuration.mode == 'relative':
+        return force_unicode(os.path.join(os.path.dirname(file_path), custom))
+    return None
+
+
+def get_subtitle_output_directories(file_path: str,
+                                    configuration: SubtitleDirectorySettings | None = None) -> set[Path]:
+    """Return subtitle locations without creating directories."""
+    directories = {Path(file_path).parent}
+    target = get_subtitle_target_path(file_path, configuration)
+    if target is not None:
+        directories.add(Path(target))
+    return directories
 
 
 def get_target_folder(file_path: str) -> str | None:
@@ -89,35 +127,13 @@ def get_target_folder(file_path: str) -> str | None:
         dedicated subfolder applies, the subfolder mode is unknown, or the
         directory could not be created.
     """
-    subfolder = settings.general.subfolder
-    fld_custom = str(settings.general.subfolder_custom).strip() \
-        if settings.general.subfolder_custom else None
-
-    if subfolder != "current" and fld_custom:
-        # specific subFolder requested, create it if it doesn't exist
-        fld_base = os.path.split(file_path)[0]
-
-        if subfolder == "absolute":
-            # absolute folder
-            fld = fld_custom
-        elif subfolder == "relative":
-            fld = os.path.join(fld_base, fld_custom)
-        else:
-            fld = None
-
-        if fld is None:
+    fld = get_subtitle_target_path(file_path)
+    if fld is not None and not os.path.isdir(fld):
+        try:
+            os.makedirs(fld)
+        except Exception:
+            logging.error(f'BAZARR is unable to create directory to save subtitles: {fld}')
             return None
-        fld = force_unicode(fld)
-
-        if not os.path.isdir(fld):
-            try:
-                os.makedirs(fld)
-            except Exception:
-                logging.error(f'BAZARR is unable to create directory to save subtitles: {fld}')
-                fld = None
-    else:
-        fld = None
-
     return fld
 
 

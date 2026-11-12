@@ -120,7 +120,7 @@ def _try_file_lock(file: BinaryIO) -> None:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
-def _lock_file(file: BinaryIO, job_id: int | None) -> None:
+def _lock_file(file: BinaryIO, job_id: int | None, *, blocking: bool = True) -> None:
     while True:
         _raise_if_canceled(job_id)
         try:
@@ -129,12 +129,17 @@ def _lock_file(file: BinaryIO, job_id: int | None) -> None:
         except OSError as error:
             if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
                 raise
+            if not blocking:
+                raise BlockingIOError('Cannot acquire lock: active media writer') from error
         time.sleep(0.05)
 
 
 @contextmanager
-def _thread_lock(lock: _MediaLock, job_id: int | None) -> Iterator[None]:
-    while not lock.mutex.acquire(timeout=0.05):
+def _thread_lock(lock: _MediaLock, job_id: int | None, *, blocking: bool = True) -> Iterator[None]:
+    _raise_if_canceled(job_id)
+    if not blocking and not lock.mutex.acquire(blocking=False):
+        raise BlockingIOError('Cannot acquire lock: active media writer')
+    while blocking and not lock.mutex.acquire(timeout=0.05):
         _raise_if_canceled(job_id)
     try:
         _raise_if_canceled(job_id)
@@ -143,8 +148,9 @@ def _thread_lock(lock: _MediaLock, job_id: int | None) -> Iterator[None]:
         lock.mutex.release()
 
 @contextmanager
-def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[MediaWriteState]:
-    """Serialize writers and expose state changes before their bodies run."""
+def media_write_lock(video_path: str, *, job_id: int | None = None,
+                     blocking: bool = True) -> Iterator[MediaWriteState]:
+    """Serialize writers; nonblocking acquisition refuses live owners before changing state."""
     canonical = _canonical_path(video_path)
     with _registry_mutex:
         lock = _locks.get(canonical)
@@ -152,7 +158,7 @@ def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[
             lock = _MediaLock()
             _locks[canonical] = lock
 
-    with _thread_lock(lock, job_id):
+    with _thread_lock(lock, job_id, blocking=blocking):
         if lock.depth:
             lock.depth += 1
             try:
@@ -166,7 +172,7 @@ def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[
         # Retain lock files; unlinking them splits waiting and new writers across inodes.
         descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o600)
         with os.fdopen(descriptor, 'r+b') as file:
-            _lock_file(file, job_id)
+            _lock_file(file, job_id, blocking=blocking)
             previous = _read_write_state(file)
             current = _record_write_state(file, active=True)
             lock.file = file
@@ -212,23 +218,9 @@ if hasattr(os, 'register_at_fork'):
 def subtitle_media_path(subtitle_path: str, video_path: str | None = None, *,
                         allow_unindexed: bool = False) -> str:
     """Resolve indexed ownership or validate fresh sidecars against the video and output location."""
-    from app.database import (database, select, TableEpisodes, TableEpisodesSubtitles,
-                              TableMovies, TableMoviesSubtitles)
-    from utilities.path_mappings import path_mappings
+    from utilities.subtitle_ownership import indexed_subtitle_owners
 
-    canonical_subtitle = _canonical_path(subtitle_path)
-    owners = set()
-    for media, subtitles, identifier, reverse, forward in (
-        (TableEpisodes, TableEpisodesSubtitles, 'sonarrEpisodeId',
-         path_mappings.path_replace_reverse, path_mappings.path_replace),
-        (TableMovies, TableMoviesSubtitles, 'radarrId',
-         path_mappings.path_replace_reverse_movie, path_mappings.path_replace_movie),
-    ):
-        candidates = (subtitle_path, reverse(subtitle_path), canonical_subtitle, reverse(canonical_subtitle))
-        rows = database.execute(
-            select(media.path).join(subtitles, getattr(media, identifier) == getattr(subtitles, identifier))
-            .where(subtitles.path.in_(candidates))).all()
-        owners.update(_canonical_path(forward(row.path)) for row in rows)
+    owners = indexed_subtitle_owners((subtitle_path,))
     if owners:
         if len(owners) != 1:
             raise OSError('Subtitle is indexed for multiple media files')
@@ -266,14 +258,6 @@ def _fresh_sidecar_owner(subtitle_path: str, video_path: str) -> str:
 
 
 def _output_locations(video_path: str) -> set[str]:
-    from app.config import settings
-    from utilities.helper import get_subtitle_destination_folder
+    from utilities.helper import get_subtitle_output_directories
 
-    directory = os.path.dirname(video_path)
-    destinations = {_canonical_path(directory)}
-    custom = get_subtitle_destination_folder()
-    if custom and settings.general.subfolder == 'absolute':
-        destinations.add(_canonical_path(custom))
-    elif custom and settings.general.subfolder == 'relative':
-        destinations.add(_canonical_path(os.path.join(directory, custom)))
-    return destinations
+    return {_canonical_path(str(path)) for path in get_subtitle_output_directories(video_path)}

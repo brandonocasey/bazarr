@@ -149,6 +149,7 @@ class TableSubtitleCleanupOperations(Base):
     video_path = mapped_column(Text, nullable=False, index=True)
     status = mapped_column(Text, nullable=False)
     job_id = mapped_column(Integer, nullable=True)
+    recovery_pending = mapped_column(Boolean, nullable=False, default=False, server_default=text('false'))
     payload = mapped_column(Text, nullable=False)
     created_at = mapped_column(DateTime, nullable=False, default=datetime.now)
 
