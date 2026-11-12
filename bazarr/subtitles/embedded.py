@@ -26,6 +26,7 @@ from sonarr.notify import notify_sonarr
 from subtitles.indexer.movies import store_subtitles_movie
 from subtitles.indexer.series import store_subtitles
 from subtitles.processing import ProcessSubtitlesResult
+from utilities.media_write_lock import media_write_lock
 from utilities.autopulse_webhook import call_external_webhook
 from utilities.binaries import get_binary
 from utilities.helper import get_target_folder
@@ -154,139 +155,140 @@ def extract_embedded_subtitle(subtitles_id, media_type, job_id=None, filename_su
         video_path = path_mappings.path_replace_movie(data.path)
         media_id = data.radarrId
 
-    if not os.path.isfile(video_path):
-        jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract embedded subtitles for video file "
-                                                               f"{video_path}")
-        raise OSError(f"Media file not found: {video_path}")
+    with media_write_lock(video_path):
+        if not os.path.isfile(video_path):
+            jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract embedded subtitles for video file "
+                                                                   f"{video_path}")
+            raise OSError(f"Media file not found: {video_path}")
 
-    # Read the subtitles streams from the media file and find the requested track
-    container.FFPROBE_PATH = get_binary("ffprobe")
-    container.FFMPEG_PATH = get_binary("ffmpeg")
+        # Read the subtitles streams from the media file and find the requested track
+        container.FFPROBE_PATH = get_binary("ffprobe")
+        container.FFMPEG_PATH = get_binary("ffmpeg")
 
-    streams = FFprobeVideoContainer(video_path).get_subtitles()
-    stream = next((s for s in streams if s.index == data.embedded_track_id), None)
-    if stream is None:
-        jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract an unknown embedded subtitles track "
-                                                               f"in {video_path}")
-        raise EmbeddedSubtitlesExtractionError(
-            f"Embedded track {data.embedded_track_id} not found in {video_path}")
+        streams = FFprobeVideoContainer(video_path).get_subtitles()
+        stream = next((s for s in streams if s.index == data.embedded_track_id), None)
+        if stream is None:
+            jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract an unknown embedded subtitles track "
+                                                                   f"in {video_path}")
+            raise EmbeddedSubtitlesExtractionError(
+                f"Embedded track {data.embedded_track_id} not found in {video_path}")
 
-    # Only text-based subtitles can be extracted; reject image/bitmap based tracks
-    extension = _CODEC_TO_EXTENSION.get(stream.codec_name)
-    if extension is None:
-        if stream.type != "text":
-            jobs_queue.update_job_name(job_id=job_id,
-                                       new_job_name=f"Failed to extract an image-based embedded subtitles track "
-                                                    f"{stream.codec_name} in {video_path}")
-            raise BitmapSubtitlesNotSupportedError(
-                f"Image based ({stream.codec_name}) embedded subtitles cannot be extracted")
-        jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract an unsupported embedded subtitles "
-                                                               f"codec {stream.codec_name}")
-        raise EmbeddedSubtitlesExtractionError(f"Unsupported embedded subtitles codec: {stream.codec_name}")
+        # Only text-based subtitles can be extracted; reject image/bitmap based tracks
+        extension = _CODEC_TO_EXTENSION.get(stream.codec_name)
+        if extension is None:
+            if stream.type != "text":
+                jobs_queue.update_job_name(job_id=job_id,
+                                           new_job_name=f"Failed to extract an image-based embedded subtitles track "
+                                                        f"{stream.codec_name} in {video_path}")
+                raise BitmapSubtitlesNotSupportedError(
+                    f"Image based ({stream.codec_name}) embedded subtitles cannot be extracted")
+            jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract an unsupported embedded subtitles "
+                                                                   f"codec {stream.codec_name}")
+            raise EmbeddedSubtitlesExtractionError(f"Unsupported embedded subtitles codec: {stream.codec_name}")
 
-    # Build the destination path following the user's subtitles location settings
-    language = _language_from_alpha2(data.language)
-    subtitles_path = get_subtitle_path(video_path,
-                                       language=language,
-                                       extension=f".{extension}",
-                                       forced_tag=data.forced,
-                                       hi_tag=data.hi)
-    target_folder = get_target_folder(video_path)
-    if target_folder:
-        subtitles_path = os.path.join(target_folder, os.path.basename(subtitles_path))
-    if filename_suffix:
-        filename, extension = os.path.splitext(subtitles_path)
-        subtitles_path = f'{filename}{filename_suffix}{extension}'
+        # Build the destination path following the user's subtitles location settings
+        language = _language_from_alpha2(data.language)
+        subtitles_path = get_subtitle_path(video_path,
+                                           language=language,
+                                           extension=f".{extension}",
+                                           forced_tag=data.forced,
+                                           hi_tag=data.hi)
+        target_folder = get_target_folder(video_path)
+        if target_folder:
+            subtitles_path = os.path.join(target_folder, os.path.basename(subtitles_path))
+        if filename_suffix:
+            filename, extension = os.path.splitext(subtitles_path)
+            subtitles_path = f'{filename}{filename_suffix}{extension}'
 
-    # Extract the track with ffmpeg, copying the stream to preserve its original format
-    command = [container.FFMPEG_PATH, "-y", "-v", "error", "-i", video_path] + stream.copy_args(subtitles_path)
-    logging.debug(f"BAZARR extracting embedded subtitles track {stream.index} ({stream.codec_name}) "
-                  f"to {subtitles_path}")
-    try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as error:
-        stderr = error.stderr.decode(errors='ignore').strip() if error.stderr else ''
-        jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract embedded subtitles "
-                                                               f"{stderr or error}")
-        raise EmbeddedSubtitlesExtractionError(f"ffmpeg failed to extract embedded subtitles: {stderr or error}") \
-            from error
+        # Extract the track with ffmpeg, copying the stream to preserve its original format
+        command = [container.FFMPEG_PATH, "-y", "-v", "error", "-i", video_path] + stream.copy_args(subtitles_path)
+        logging.debug(f"BAZARR extracting embedded subtitles track {stream.index} ({stream.codec_name}) "
+                      f"to {subtitles_path}")
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as error:
+            stderr = error.stderr.decode(errors='ignore').strip() if error.stderr else ''
+            jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract embedded subtitles "
+                                                                   f"{stderr or error}")
+            raise EmbeddedSubtitlesExtractionError(f"ffmpeg failed to extract embedded subtitles: {stderr or error}") \
+                from error
 
-    if not os.path.isfile(subtitles_path):
-        jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract embedded subtitles since file is "
-                                                               f"missing: {subtitles_path}")
-        raise EmbeddedSubtitlesExtractionError(f"Extracted subtitles file is missing: {subtitles_path}")
+        if not os.path.isfile(subtitles_path):
+            jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract embedded subtitles since file is "
+                                                                   f"missing: {subtitles_path}")
+            raise EmbeddedSubtitlesExtractionError(f"Extracted subtitles file is missing: {subtitles_path}")
 
-    # Set permissions, reindex the newly created external subtitles and notify the UI
-    set_chmod(subtitles_path)
+        # Set permissions, reindex the newly created external subtitles and notify the UI
+        set_chmod(subtitles_path)
 
-    if media_type == 'episode':
-        store_subtitles(media_id)
-    else:
-        store_subtitles_movie(media_id)
-    event_stream(type=media_type, payload=media_id)
+        if media_type == 'episode':
+            store_subtitles(media_id)
+        else:
+            store_subtitles_movie(media_id)
+        event_stream(type=media_type, payload=media_id)
 
-    # Log the extraction to the history database (action 7 == extracted)
-    modifier = " HI" if data.hi else " forced" if data.forced else ""
-    if media_type == 'episode':
-        reversed_video_path = path_mappings.path_replace_reverse(video_path)
-        reversed_subtitles_path = path_mappings.path_replace_reverse(subtitles_path)
-    else:
-        reversed_video_path = path_mappings.path_replace_reverse_movie(video_path)
-        reversed_subtitles_path = path_mappings.path_replace_reverse_movie(subtitles_path)
+        # Log the extraction to the history database (action 7 == extracted)
+        modifier = " HI" if data.hi else " forced" if data.forced else ""
+        if media_type == 'episode':
+            reversed_video_path = path_mappings.path_replace_reverse(video_path)
+            reversed_subtitles_path = path_mappings.path_replace_reverse(subtitles_path)
+        else:
+            reversed_video_path = path_mappings.path_replace_reverse_movie(video_path)
+            reversed_subtitles_path = path_mappings.path_replace_reverse_movie(subtitles_path)
 
-    result = ProcessSubtitlesResult(
-        message=f"{language_from_alpha2(data.language)}{modifier} subtitles extracted from embedded track "
-                f"{data.embedded_track_id}.",
-        reversed_path=reversed_video_path,
-        downloaded_language_code2=data.language,
-        downloaded_provider=None,
-        score=None,
-        forced=data.forced,
-        subtitle_id=f"{video_path}_{stream.index}",
-        reversed_subtitles_path=reversed_subtitles_path,
-        hearing_impaired=data.hi)
+        result = ProcessSubtitlesResult(
+            message=f"{language_from_alpha2(data.language)}{modifier} subtitles extracted from embedded track "
+                    f"{data.embedded_track_id}.",
+            reversed_path=reversed_video_path,
+            downloaded_language_code2=data.language,
+            downloaded_provider=None,
+            score=None,
+            forced=data.forced,
+            subtitle_id=f"{video_path}_{stream.index}",
+            reversed_subtitles_path=reversed_subtitles_path,
+            hearing_impaired=data.hi)
 
-    if media_type == 'episode':
-        history_log(7, data.sonarrSeriesId, media_id, result, fake_score=MAX_SCORES['episode'])
-        event_stream(type="episode-history")
-    else:
-        history_log_movie(7, media_id, result, fake_score=MAX_SCORES['movie'])
-        event_stream(type="movie-history")
+        if media_type == 'episode':
+            history_log(7, data.sonarrSeriesId, media_id, result, fake_score=MAX_SCORES['episode'])
+            event_stream(type="episode-history")
+        else:
+            history_log_movie(7, media_id, result, fake_score=MAX_SCORES['movie'])
+            event_stream(type="movie-history")
 
-    # Notify apprise
-    if media_type == 'episode':
-        send_notifications(data.sonarrSeriesId, media_id, result.message)
-    else:
-        send_notifications_movie(media_id, result.message)
+        # Notify apprise
+        if media_type == 'episode':
+            send_notifications(data.sonarrSeriesId, media_id, result.message)
+        else:
+            send_notifications_movie(media_id, result.message)
 
-    # Notify media downloader so they update their library so the newly extracted subtitles are picked up
-    if media_type == 'episode':
-        notify_sonarr(data.sonarrSeriesId)
-    else:
-        notify_radarr(media_id)
+        # Notify media downloader so they update their library so the newly extracted subtitles are picked up
+        if media_type == 'episode':
+            notify_sonarr(data.sonarrSeriesId)
+        else:
+            notify_radarr(media_id)
 
-    # Refresh the media servers so the newly extracted subtitles are picked up
-    if media_type == 'episode':
-        if settings.general.use_plex and settings.plex.update_series_library:
-            plex_refresh_item(data.imdbId, is_movie=False, season=data.season, episode=data.episode)
-        if settings.general.use_jellyfin and settings.jellyfin.update_series_library:
-            jellyfin_refresh_item(data.imdbId, is_movie=False, season=data.season, episode=data.episode,
-                                  tvdb_id=data.tvdbId)
-    else:
-        if settings.general.use_plex and settings.plex.update_movie_library:
-            plex_refresh_item(data.imdbId, is_movie=True)
-        if settings.general.use_jellyfin and settings.jellyfin.update_movie_library:
-            jellyfin_refresh_item(data.imdbId, is_movie=True, tmdb_id=data.tmdbId)
+        # Refresh the media servers so the newly extracted subtitles are picked up
+        if media_type == 'episode':
+            if settings.general.use_plex and settings.plex.update_series_library:
+                plex_refresh_item(data.imdbId, is_movie=False, season=data.season, episode=data.episode)
+            if settings.general.use_jellyfin and settings.jellyfin.update_series_library:
+                jellyfin_refresh_item(data.imdbId, is_movie=False, season=data.season, episode=data.episode,
+                                      tvdb_id=data.tvdbId)
+        else:
+            if settings.general.use_plex and settings.plex.update_movie_library:
+                plex_refresh_item(data.imdbId, is_movie=True)
+            if settings.general.use_jellyfin and settings.jellyfin.update_movie_library:
+                jellyfin_refresh_item(data.imdbId, is_movie=True, tmdb_id=data.tmdbId)
 
-    # Call external webhook after all processing is complete if enabled
-    call_external_webhook(
-        subtitle_path=subtitles_path,
-        media_path=video_path,
-        language=language,
-        media_type=media_type,
-        action_type='add'
-    )
+        # Call external webhook after all processing is complete if enabled
+        call_external_webhook(
+            subtitle_path=subtitles_path,
+            media_path=video_path,
+            language=language,
+            media_type=media_type,
+            action_type='add'
+        )
 
-    logging.debug(f"BAZARR extracted embedded subtitles to {subtitles_path}")
-    jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Extracted {subtitles_path}")
-    return subtitles_path
+        logging.debug(f"BAZARR extracted embedded subtitles to {subtitles_path}")
+        jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Extracted {subtitles_path}")
+        return subtitles_path

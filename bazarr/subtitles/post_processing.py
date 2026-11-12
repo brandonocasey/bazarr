@@ -8,32 +8,35 @@ import shlex
 
 from locale import getpreferredencoding
 
+from utilities.media_write_lock import media_write_lock
+
 
 def postprocessing(args, path):
-    try:
-        encoding = getpreferredencoding()
-        if os.name == 'nt':
-            from ctypes import windll
-            code_page = windll.kernel32.GetConsoleOutputCP()
-            encoding = f"cp{code_page}"
+    with media_write_lock(path):
+        try:
+            encoding = getpreferredencoding()
+            if os.name == 'nt':
+                from ctypes import windll
+                code_page = windll.kernel32.GetConsoleOutputCP()
+                encoding = f"cp{code_page}"
 
-        # Use shell=False to avoid CWE-78 OS command injection via shell metacharacters.
-        process = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, encoding=encoding)
+            # Use shell=False to avoid CWE-78 OS command injection via shell metacharacters.
+            process = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, encoding=encoding)
 
-        # wait for the process to terminate
-        out, err = process.communicate()
+            # wait for the process to terminate
+            out, err = process.communicate()
 
-        out = out.replace('\n', ' ').replace('\r', ' ')
+            out = out.replace('\n', ' ').replace('\r', ' ')
 
-    except Exception as e:
-        logging.error(f'BAZARR Post-processing failed for file {path}: {str(e)}', exc_info=True)
-    else:
-        if err:
-            parsed_err = err.replace('\n', ' ').replace('\r', ' ')
-            logging.error(f'BAZARR Post-processing result for file {path}: {parsed_err}')
-        elif out == "":
-            logging.info(
-                f'BAZARR Post-processing result for file {path}: Nothing returned from command execution')
+        except Exception as e:
+            logging.error(f'BAZARR Post-processing failed for file {path}: {str(e)}', exc_info=True)
         else:
-            logging.info(f'BAZARR Post-processing result for file {path}: {out}')
+            if err:
+                parsed_err = err.replace('\n', ' ').replace('\r', ' ')
+                logging.error(f'BAZARR Post-processing result for file {path}: {parsed_err}')
+            elif out == "":
+                logging.info(
+                    f'BAZARR Post-processing result for file {path}: Nothing returned from command execution')
+            else:
+                logging.info(f'BAZARR Post-processing result for file {path}: {out}')

@@ -13,6 +13,7 @@ from pysubs2.formats import get_format_identifier
 
 from languages.get_languages import language_from_alpha3, alpha2_from_alpha3, alpha3_from_alpha2
 from app.config import settings, get_array_from
+from utilities.media_write_lock import media_write_lock
 from utilities.helper import get_target_folder, force_unicode
 from utilities.post_processing import pp_replace, set_chmod
 from utilities.path_mappings import path_mappings
@@ -144,14 +145,15 @@ def manual_upload_subtitle(path, language, forced, hi, media_type, subtitle, fil
     try:
         # ensure that formats must be a tuple of strings
         sub_format = (sub.format,) if isinstance(sub.format, str) else sub.format
-        saved_subtitles = save_subtitles(path,
-                                         [sub],
-                                         single=single,
-                                         tags=None,  # fixme
-                                         directory=get_target_folder(path),
-                                         chmod=chmod,
-                                         formats=sub_format if use_original_format else ("srt",),
-                                         path_decoder=force_unicode)
+        with media_write_lock(path):
+            saved_subtitles = save_subtitles(path,
+                                             [sub],
+                                             single=single,
+                                             tags=None,  # fixme
+                                             directory=get_target_folder(path),
+                                             chmod=chmod,
+                                             formats=sub_format if use_original_format else ("srt",),
+                                             path_decoder=force_unicode)
     except Exception as e:
         logging.exception(f'BAZARR Error saving Subtitles file to disk for this file {path}: {str(e)}')
         return
@@ -184,8 +186,9 @@ def manual_upload_subtitle(path, language, forced, hi, media_type, subtitle, fil
                           uploaded_language_code3, audio_language['name'], audio_language['code2'],
                           audio_language['code3'], 100, "1", "manual", "user", "unknown", sonarrSeriesId,
                           sonarrEpisodeId or radarrId,)
-        postprocessing(args, path)
-        set_chmod(subtitles_path=subtitle_path)
+        with media_write_lock(path):
+            postprocessing(args, path)
+            set_chmod(subtitles_path=subtitle_path)
 
     if media_type == 'series':
         # notify Sonarr once the queued sync job is done so it sees the synced file

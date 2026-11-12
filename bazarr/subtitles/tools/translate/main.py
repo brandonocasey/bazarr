@@ -12,6 +12,7 @@ from .services.translator_factory import TranslatorFactory
 from languages.get_languages import alpha3_from_alpha2
 from app.config import settings
 from app.jobs_queue import jobs_queue
+from utilities.media_write_lock import media_write_lock, subtitle_media_path
 from utilities.helper import get_target_folder
 
 
@@ -49,79 +50,80 @@ def translate_subtitles_file(video_path, source_srt_file, from_lang, to_lang, fo
                                          is_progress=True)
         return
 
-    try:
-        logging.debug(f'Translation request: video={video_path}, source={source_srt_file}, from={from_lang}, to={to_lang}')
+    with media_write_lock(subtitle_media_path(source_srt_file, video_path, allow_unindexed=True)):
+        try:
+            logging.debug(f'Translation request: video={video_path}, source={source_srt_file}, from={from_lang}, to={to_lang}')
 
-        validate_translation_params(video_path, source_srt_file, from_lang, to_lang)
-        lang_obj, orig_to_lang = convert_language_codes(to_lang, forced, hi)
+            validate_translation_params(video_path, source_srt_file, from_lang, to_lang)
+            lang_obj, orig_to_lang = convert_language_codes(to_lang, forced, hi)
 
-        logging.debug(f'BAZARR is translating in {lang_obj} this subtitles {source_srt_file}')
+            logging.debug(f'BAZARR is translating in {lang_obj} this subtitles {source_srt_file}')
 
-        translator_type = settings.translator.translator_type or 'google'
+            translator_type = settings.translator.translator_type or 'google'
 
-        # Preserve the source subtitle format (.ass/.vtt) when requested instead of always
-        # writing .srt. Gemini only supports SRT and is handled by get_translation_extension.
-        dest_extension = get_translation_extension(source_srt_file, original_format, translator_type)
-        logging.debug(f'Translation destination extension: {dest_extension} '
-                      f'(original_format={original_format}, translator={translator_type})')
+            # Preserve the source subtitle format (.ass/.vtt) when requested instead of always
+            # writing .srt. Gemini only supports SRT and is handled by get_translation_extension.
+            dest_extension = get_translation_extension(source_srt_file, original_format, translator_type)
+            logging.debug(f'Translation destination extension: {dest_extension} '
+                          f'(original_format={original_format}, translator={translator_type})')
 
-        # get the destination path if the subtitles are alongside the video
-        dest_srt_file_if_alongside_video = get_subtitle_path(
-            video_path,
-            language=lang_obj if isinstance(lang_obj, Language) else lang_obj.subzero_language(),
-            extension=dest_extension,
-            forced_tag=forced,
-            hi_tag=hi
-        )
+            # get the destination path if the subtitles are alongside the video
+            dest_srt_file_if_alongside_video = get_subtitle_path(
+                video_path,
+                language=lang_obj if isinstance(lang_obj, Language) else lang_obj.subzero_language(),
+                extension=dest_extension,
+                forced_tag=forced,
+                hi_tag=hi
+            )
 
-        # get the real destination path taking into account if the user set up Bazarr to store external subtitles in
-        #  a custom folder or relative folder
-        dest_dir_for_srt = get_target_folder(video_path)
-        if dest_dir_for_srt:
-            # if the user has set up Bazarr to store external subtitles in a custom folder, we need to add the custom
-            # folder to the destination path
-            dest_srt_file = os.path.join(dest_dir_for_srt, os.path.basename(dest_srt_file_if_alongside_video))
-        else:
-            # otherwise, we just use the destination path as it is
-            dest_srt_file = dest_srt_file_if_alongside_video
+            # get the real destination path taking into account if the user set up Bazarr to store external subtitles in
+            #  a custom folder or relative folder
+            dest_dir_for_srt = get_target_folder(video_path)
+            if dest_dir_for_srt:
+                # if the user has set up Bazarr to store external subtitles in a custom folder, we need to add the custom
+                # folder to the destination path
+                dest_srt_file = os.path.join(dest_dir_for_srt, os.path.basename(dest_srt_file_if_alongside_video))
+            else:
+                # otherwise, we just use the destination path as it is
+                dest_srt_file = dest_srt_file_if_alongside_video
 
-        logging.debug(f'Using translator type: {translator_type}')
+            logging.debug(f'Using translator type: {translator_type}')
 
-        translator = TranslatorFactory.create_translator(
-            translator_type,
-            source_srt_file=source_srt_file,
-            dest_srt_file=dest_srt_file,
-            lang_obj=lang_obj,
-            from_lang=from_lang,
-            to_lang=alpha3_from_alpha2(to_lang),
-            media_type=media_type,
-            video_path=video_path,
-            orig_to_lang=orig_to_lang,
-            forced=forced,
-            hi=hi,
-            sonarr_series_id=sonarr_series_id,
-            sonarr_episode_id=sonarr_episode_id,
-            radarr_id=radarr_id
-        )
+            translator = TranslatorFactory.create_translator(
+                translator_type,
+                source_srt_file=source_srt_file,
+                dest_srt_file=dest_srt_file,
+                lang_obj=lang_obj,
+                from_lang=from_lang,
+                to_lang=alpha3_from_alpha2(to_lang),
+                media_type=media_type,
+                video_path=video_path,
+                orig_to_lang=orig_to_lang,
+                forced=forced,
+                hi=hi,
+                sonarr_series_id=sonarr_series_id,
+                sonarr_episode_id=sonarr_episode_id,
+                radarr_id=radarr_id
+            )
 
-        logging.debug(f'Created translator instance: {translator.__class__.__name__}')
-        result = translator.translate(job_id=job_id)
-        if result is False:
-            raise RuntimeError(f'{translator.__class__.__name__} returned a failed translation result')
-        logging.debug(f'BAZARR saved translated subtitles to {dest_srt_file}')
-        if metadata is not None:
-            from api.subtitles.subtitles import postprocess_subtitles
-            # Manual API translations include metadata for library refresh; automated fallback
-            # re-indexes the translated sidecar in the download workflow instead.
-            postprocess_subtitles(dest_srt_file, media_type, metadata,
-                                  sonarr_episode_id if media_type == 'episode' else radarr_id)
-        return result
+            logging.debug(f'Created translator instance: {translator.__class__.__name__}')
+            result = translator.translate(job_id=job_id)
+            if result is False:
+                raise RuntimeError(f'{translator.__class__.__name__} returned a failed translation result')
+            logging.debug(f'BAZARR saved translated subtitles to {dest_srt_file}')
+            if metadata is not None:
+                from api.subtitles.subtitles import postprocess_subtitles
+                # Manual API translations include metadata for library refresh; automated fallback
+                # re-indexes the translated sidecar in the download workflow instead.
+                postprocess_subtitles(dest_srt_file, media_type, metadata,
+                                      sonarr_episode_id if media_type == 'episode' else radarr_id)
+            return result
 
-    except Exception as e:
-        logging.error(f'Translation failed: {str(e)}', exc_info=True)
-        raise
+        except Exception as e:
+            logging.error(f'Translation failed: {str(e)}', exc_info=True)
+            raise
 
-    finally:
-        jobs_queue.update_job_name(job_id=job_id,
-                                   new_job_name=f'Translated from {from_lang.upper()} to {to_lang.upper()} using '
-                                                f'{settings.translator.translator_type.replace("_", " ").title()}')
+        finally:
+            jobs_queue.update_job_name(job_id=job_id,
+                                       new_job_name=f'Translated from {from_lang.upper()} to {to_lang.upper()} using '
+                                                    f'{settings.translator.translator_type.replace("_", " ").title()}')

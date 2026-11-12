@@ -5,6 +5,7 @@ import logging
 
 from app.config import settings, sync_checker as _defaul_sync_checker
 from utilities.path_mappings import path_mappings
+from utilities.media_write_lock import media_write_lock
 from utilities.post_processing import pp_replace, set_chmod
 from utilities.autopulse_webhook import call_external_webhook
 from languages.get_languages import alpha2_from_alpha3, alpha2_from_language, alpha3_from_language, language_from_alpha3
@@ -125,8 +126,9 @@ def process_subtitle(subtitle, media_type, audio_language, path, max_score, is_u
 
         if not use_pp_threshold or (use_pp_threshold and percent_score < pp_threshold):
             logging.debug(f"BAZARR Using post-processing command: {args}")
-            postprocessing(args, path)
-            set_chmod(subtitles_path=downloaded_path)
+            with media_write_lock(path):
+                postprocessing(args, path)
+                set_chmod(subtitles_path=downloaded_path)
         else:
             logging.debug(f"BAZARR post-processing skipped because subtitles score isn't below this "
                           f"threshold value: {pp_threshold}%")

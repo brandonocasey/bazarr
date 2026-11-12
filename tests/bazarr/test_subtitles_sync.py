@@ -98,6 +98,22 @@ def _patch_subsyncer(monkeypatch, sync_result):
     return subsyncer_module.SubSyncer(), captured
 
 
+@pytest.fixture
+def indexed_sync_media(memory_session, monkeypatch, tmp_path):
+    import app.database as app_database
+    from app.database import TableShows, TableEpisodes, TableEpisodesSubtitles
+
+    monkeypatch.setattr(app_database, "database", memory_session)
+    memory_session.add(TableShows(sonarrSeriesId=1, path="/media/show", title="Show"))
+    memory_session.commit()
+    memory_session.add(TableEpisodes(sonarrSeriesId=1, sonarrEpisodeId=2,
+                                     path="/media/show/episode.mkv", season=1, episode=1, title="Pilot"))
+    memory_session.commit()
+    memory_session.add(TableEpisodesSubtitles(sonarrSeriesId=1, sonarrEpisodeId=2, language="en",
+                                              hi=False, forced=False, path=str(tmp_path / "episode.en.srt")))
+    memory_session.commit()
+
+
 def _sync(subsyncer, srt_path, no_fix_framerate=True):
     return subsyncer.sync(video_path="/media/show/episode.mkv", srt_path=str(srt_path), srt_lang="en", hi=False,
                           forced=False, max_offset_seconds="60", no_fix_framerate=no_fix_framerate, gss=False,
@@ -105,7 +121,7 @@ def _sync(subsyncer, srt_path, no_fix_framerate=True):
                           quality_max_offset_seconds=30, quality_max_framerate_deviation=0.1)
 
 
-def test_subsyncer_enables_quality_checks_without_framerate_fixing(monkeypatch, tmp_path):
+def test_subsyncer_enables_quality_checks_without_framerate_fixing(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, {"sync_was_successful": True, "offset_seconds": 1.0,
@@ -119,7 +135,7 @@ def test_subsyncer_enables_quality_checks_without_framerate_fixing(monkeypatch, 
     assert captured["args"].quality_max_offset_seconds == 30.0
 
 
-def test_subsyncer_enables_quality_checks_with_framerate_fixing(monkeypatch, tmp_path):
+def test_subsyncer_enables_quality_checks_with_framerate_fixing(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, {"sync_was_successful": True, "offset_seconds": 1.0,
@@ -132,7 +148,7 @@ def test_subsyncer_enables_quality_checks_with_framerate_fixing(monkeypatch, tmp
     assert captured["args"].max_framerate_deviation == 0.1
 
 
-def test_subsyncer_keeps_original_when_sync_rejected(monkeypatch, tmp_path):
+def test_subsyncer_keeps_original_when_sync_rejected(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, {"sync_was_successful": False, "offset_seconds": None,
@@ -145,7 +161,7 @@ def test_subsyncer_keeps_original_when_sync_rejected(monkeypatch, tmp_path):
     assert "history" not in captured
 
 
-def test_subsyncer_replaces_original_when_sync_succeeds(monkeypatch, tmp_path):
+def test_subsyncer_replaces_original_when_sync_succeeds(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, {"sync_was_successful": True, "offset_seconds": 1.0,
@@ -278,7 +294,7 @@ def test_sync_subtitles_propagates_cancel_and_runs_callback(monkeypatch):
     assert calls == [True]
 
 
-def test_subsyncer_removes_partial_output_when_canceled(monkeypatch, tmp_path):
+def test_subsyncer_removes_partial_output_when_canceled(monkeypatch, tmp_path, indexed_sync_media):
     srt = tmp_path / "episode.en.srt"
     srt.write_text("original")
     subsyncer, captured = _patch_subsyncer(monkeypatch, None)
