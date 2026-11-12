@@ -1,0 +1,227 @@
+# coding=utf-8
+
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+from collections.abc import Callable, Sequence
+from sqlalchemy.engine import Row
+
+from .records import IndexedSubtitle, MediaMetadata, Operation
+
+from app.database import (database, select, update, TableSubtitleCleanupOperations, TableMovies,
+                          TableEpisodes, TableMoviesSubtitles, TableEpisodesSubtitles,
+                          TableHistory, TableHistoryMovie, SUBTITLE_MAP_QUERY_BATCH_SIZE)
+from utilities.path_mappings import path_mappings
+
+
+class CleanupError(ValueError):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+def _canonical_source(path: str) -> str:
+    if Path(path).is_symlink():
+        raise CleanupError(f'Cleanup cannot replace a symlink: {path}', 409)
+    return os.path.realpath(path)
+
+
+def media_metadata(media_type: str, media_id: int) -> MediaMetadata:
+    if media_type == 'movie':
+        row = database.execute(select(TableMovies.path, TableMovies.title)
+                               .where(TableMovies.radarrId == media_id)).first()
+        mapper = path_mappings.path_replace_movie
+    elif media_type == 'series':
+        row = database.execute(select(TableEpisodes.path, TableEpisodes.title)
+                               .where(TableEpisodes.sonarrEpisodeId == media_id)).first()
+        mapper = path_mappings.path_replace
+    else:
+        raise CleanupError('Media type must be movie or series')
+    if row is None or not row.path:
+        raise CleanupError('Indexed media file not found', 404)
+    return {'video_path': _canonical_source(mapper(row.path)), 'title': row.title or Path(row.path).name,
+            'indexed_path': row.path}
+
+
+def indexed_subtitles(media_type: str, media_id: int) -> list[IndexedSubtitle]:
+    table = TableMoviesSubtitles if media_type == 'movie' else TableEpisodesSubtitles
+    identity = table.radarrId if media_type == 'movie' else table.sonarrEpisodeId
+    mapper = path_mappings.path_replace_movie if media_type == 'movie' else path_mappings.path_replace
+    rows = database.execute(select(table.path, table.language, table.forced, table.hi)
+                            .where(identity == media_id, table.path.is_not(None))).all()
+    subtitles: list[IndexedSubtitle] = [{'path': _canonical_source(mapper(row.path)), 'language': row.language,
+                  'forced': bool(row.forced), 'hearing_impaired': bool(row.hi)} for row in rows]
+    video = Path(media_metadata(media_type, media_id)['video_path'])
+    known = {item['path'] for item in subtitles}
+    for item in _sidecar_files(video):
+        path = _canonical_source(str(item))
+        if path not in known:
+            subtitles.append(_sidecar_metadata(item, video))
+            known.add(path)
+    _assert_exclusive_owners(str(video), known)
+    return sorted(subtitles, key=lambda row: (row['path'], row['language'], row['forced'], row['hearing_impaired']))
+
+
+def _assert_exclusive_owners(video_path: str, paths: set[str]) -> None:
+    sources = (
+        (TableEpisodes, TableEpisodesSubtitles, 'sonarrEpisodeId',
+         path_mappings.path_replace_reverse, path_mappings.path_replace),
+        (TableMovies, TableMoviesSubtitles, 'radarrId',
+         path_mappings.path_replace_reverse_movie, path_mappings.path_replace_movie),
+    )
+    for media, subtitles, identity, reverse, forward in sources:
+        aliases = set()
+        for path in paths:
+            aliases.update((path, reverse(path)))
+        values = sorted(aliases)
+        for offset in range(0, len(values), SUBTITLE_MAP_QUERY_BATCH_SIZE):
+            rows = database.execute(select(media.path).join(
+                subtitles, getattr(media, identity) == getattr(subtitles, identity))
+                .where(subtitles.path.in_(values[offset:offset + SUBTITLE_MAP_QUERY_BATCH_SIZE]))).all()
+            _verify_owner_rows(rows, video_path, forward)
+
+
+def _verify_owner_rows(rows: Sequence[Row[tuple[str]]], video_path: str, forward: Callable[[str], str]) -> None:
+    for row in rows:
+        if os.path.normcase(os.path.realpath(forward(row.path))) != os.path.normcase(video_path):
+            raise CleanupError('Subtitle is also indexed for another video; refusing shared-file cleanup', 409)
+
+
+def _sidecar_files(video: Path) -> list[Path]:
+    from app.config import settings
+    from utilities.helper import get_subtitle_destination_folder
+    from subliminal_patch.core import SUBTITLE_EXTENSIONS
+
+    locations = {video.parent}
+    custom = get_subtitle_destination_folder()
+    if custom and settings.general.subfolder == 'absolute':
+        locations.add(Path(custom))
+    elif custom and settings.general.subfolder == 'relative':
+        locations.add(video.parent / custom)
+    extensions = {*SUBTITLE_EXTENSIONS, '.idx', '.sup', '.scc', '.ttml', '.dfxp'}
+    prefix = os.path.normcase(video.stem)
+    found = []
+    for directory in locations:
+        if not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            stem = os.path.normcase(path.stem)
+            if path.is_file() and path.suffix.lower() in extensions and (stem == prefix or stem.startswith(prefix + '.')):
+                found.append(path)
+    return found
+
+
+def _sidecar_metadata(path: Path, video: Path) -> IndexedSubtitle:
+    from babelfish import Language, Error
+
+    tokens = path.stem[len(video.stem):].strip('.').lower().split('.')
+    language = 'und'
+    roles = tokens
+    for index, token in enumerate(tokens):
+        try:
+            language = str(Language.fromietf(token))
+            roles = tokens[:index] + tokens[index + 1:]
+            break
+        except (Error, ValueError):
+            continue
+    return {'path': _canonical_source(str(path)), 'language': language,
+            'forced': 'forced' in roles, 'hearing_impaired': bool({'hi', 'sdh'}.intersection(roles))}
+
+
+def download_scores(media_type: str, media_id: int, indexed_path: str) -> dict[str, float]:
+    table = TableHistoryMovie if media_type == 'movie' else TableHistory
+    identity = table.radarrId if media_type == 'movie' else table.sonarrEpisodeId
+    mapper = path_mappings.path_replace_movie if media_type == 'movie' else path_mappings.path_replace
+    rows = database.execute(select(table.subtitles_path, table.score, table.score_out_of)
+                            .where(identity == media_id, table.video_path == indexed_path,
+                                   table.action.in_((1, 2, 3)), table.score.is_not(None), table.score_out_of > 0)
+                            .order_by(table.id)).all()
+    return {os.path.realpath(mapper(row.subtitles_path)): round(row.score * 100 / row.score_out_of, 2)
+            for row in rows if row.subtitles_path and 0 <= row.score <= row.score_out_of}
+
+
+def create_operation(media_type: str, media_id: int, audio_stream_index: int | None) -> Operation:
+    metadata = media_metadata(media_type, media_id)
+    operation: Operation = {
+        'job_id': None, 'indexed_subtitles': [], 'selected_keepers': [],
+        'id': str(uuid4()), 'status': 'queued', 'media_type': media_type, 'media_id': media_id,
+        'title': metadata['title'], 'video_path': metadata['video_path'],
+        'audio_stream_index': audio_stream_index, 'preview_token': '', 'analysis': None,
+        'groups': [], 'files': [], 'required_space_bytes': 0, 'backup_path': None,
+        'result': None, 'error': None, 'created_at': datetime.now(timezone.utc).isoformat(),
+    }
+    database.add(TableSubtitleCleanupOperations(
+        id=operation['id'], media_type=media_type, media_id=media_id,
+        video_path=os.path.normcase(metadata['video_path']),
+        status='queued', payload=json.dumps(operation), created_at=datetime.now(timezone.utc),
+    ))
+    database.commit()
+    return operation
+
+
+def get_operation(operation_id: str) -> Operation:
+    row = database.execute(select(TableSubtitleCleanupOperations.payload, TableSubtitleCleanupOperations.job_id)
+                           .where(TableSubtitleCleanupOperations.id == operation_id)).first()
+    if row is None:
+        raise CleanupError('Cleanup operation not found', 404)
+    payload = json.loads(row.payload)
+    payload['job_id'] = row.job_id
+    return payload
+
+
+def set_job_id(operation_id: str, job_id: int) -> Operation:
+    database.execute(update(TableSubtitleCleanupOperations).where(TableSubtitleCleanupOperations.id == operation_id)
+                     .values(job_id=job_id))
+    database.commit()
+    return get_operation(operation_id)
+
+
+def list_operations(media_type: str, media_id: int) -> list[Operation]:
+    rows = database.execute(select(TableSubtitleCleanupOperations.payload)
+                            .where(TableSubtitleCleanupOperations.media_type == media_type,
+                                   TableSubtitleCleanupOperations.media_id == media_id)
+                            .order_by(TableSubtitleCleanupOperations.created_at.desc())).all()
+    return [json.loads(row.payload) for row in rows]
+
+
+def update_operation(operation: Operation, previous: tuple[str, ...] | None = None) -> Operation:
+    statement = update(TableSubtitleCleanupOperations).where(TableSubtitleCleanupOperations.id == operation['id'])
+    if previous is not None:
+        statement = statement.where(TableSubtitleCleanupOperations.status.in_(previous))
+    result = database.execute(statement.values(status=operation['status'], payload=json.dumps(operation, allow_nan=False))
+                              .returning(TableSubtitleCleanupOperations.id)).scalar_one_or_none()
+    if result != operation['id']:
+        database.rollback()
+        raise CleanupError('Cleanup operation changed; reload its current state', 409)
+    database.commit()
+    return operation
+
+
+def recovery_operations(video_path: str) -> list[Operation]:
+    rows = database.execute(select(TableSubtitleCleanupOperations.payload)
+                            .where(TableSubtitleCleanupOperations.video_path == os.path.normcase(video_path),
+                                   TableSubtitleCleanupOperations.status.in_(('applying', 'restoring', 'failed')))
+                            .order_by(TableSubtitleCleanupOperations.created_at)).all()
+    return [json.loads(row.payload) for row in rows]
+
+
+def refresh_inventory(operation: Operation) -> None:
+    from app.event_handler import event_stream
+    path = operation['video_path']
+    if operation['media_type'] == 'movie':
+        from subtitles.indexer.movies import store_subtitles_movie
+        database.execute(update(TableMovies).where(TableMovies.radarrId == operation['media_id'])
+                         .values(file_size=os.path.getsize(path), ffprobe_cache=None))
+        database.commit()
+        store_subtitles_movie(operation['media_id'], use_cache=False)
+        event_stream(type='movie', payload=operation['media_id'])
+    else:
+        from subtitles.indexer.series import store_subtitles
+        database.execute(update(TableEpisodes).where(TableEpisodes.sonarrEpisodeId == operation['media_id'])
+                         .values(file_size=os.path.getsize(path), ffprobe_cache=None))
+        database.commit()
+        store_subtitles(operation['media_id'], use_cache=False)
+        event_stream(type='episode', payload=operation['media_id'])
+    database.commit()

@@ -1,9 +1,8 @@
-# Redundant subtitle cleanup proposal
+# Redundant subtitle cleanup design
 
 Videos can contain several subtitle tracks for the same language.
 Existing download scores cannot rank every external or embedded track.
-This proposal adds analysis, a cleanup preview, confirmed removal, and restoration.
-It contains no feature implementation.
+Cleanup adds analysis, a preview, confirmed removal, and restoration.
 
 ## Scope
 
@@ -15,7 +14,7 @@ It contains no feature implementation.
 
 The [original request](https://bazarr.featureupvote.com/suggestions/54275/option-to-delete-redundant-subtitles)
 describes redundant external and embedded subtitles.
-The scoring definition and forced-subtitle grouping below remain proposed decisions.
+The common score measures speech timing, with separate forced-subtitle groups.
 
 ## Common timing score
 
@@ -42,7 +41,7 @@ It cannot judge wording, translation, language correctness, completeness, or act
 Legitimate reading time, sound descriptions, signs, and dubbed audio can affect the ranking.
 The preview must explain these limits before confirmation.
 
-Proposed grouping: compare within each language, keeping forced translations separate from full-dialogue subtitles.
+Compare within each language, keeping forced translations separate from full-dialogue subtitles.
 Regular and hearing-impaired subtitles compete within each group.
 
 ## Subtitle analysis and container handling
@@ -99,21 +98,15 @@ Authentication or an editable feature flag cannot provide that boundary alone.
 Cover application programming interface (API) calls, jobs, command-line routes, restoration, alternate invocations, and configurable paths.
 The deployment must deny production mutation until that boundary exists.
 Development verification uses disposable media.
-This proposal does not authorize production deployment or changes to existing libraries.
+Development verification does not authorize production deployment or changes to existing libraries.
 
-## Implementation sequence
+## Implementation
 
-1. Add cleanup analysis and operation records, with the required database migration.
-2. Add shared media-write coordination and authenticated preview, apply, and restore APIs.
-3. Add shared frontend previews, episode/movie actions, bulk selection, results, and restore controls.
-4. Add scoring, container-preservation, concurrency, failure-recovery, and restoration tests.
-5. Verify isolated running Bazarr with disposable media in Chrome and Firefox.
-6. Run existing checks and independent reviews before shipping the implementation.
-
-Place the proposed cleanup backend under `bazarr/subtitles/cleanup/`.
-Integrate inventory and operation records with [the database](../bazarr/app/database.py).
-Extend the existing [subtitle action menu](../frontend/src/components/SubtitleToolsMenu.tsx)
-and [bulk tools](../frontend/src/components/modals/SubtitleToolsModal.tsx).
+The cleanup backend lives under `bazarr/subtitles/cleanup/`.
+Operation records integrate with [the database](../bazarr/app/database.py).
+The [subtitle action menu](../frontend/src/components/SubtitleToolsMenu.tsx)
+and [bulk tools](../frontend/src/components/modals/SubtitleToolsModal.tsx) open the shared preview.
+See [cleanup controls](../frontend/README.md#subtitle-cleanup) for the interface workflow.
 
 ## Acceptance criteria
 
@@ -126,10 +119,8 @@ and [bulk tools](../frontend/src/components/modals/SubtitleToolsModal.tsx).
 - Restoration recovers originals and refuses to overwrite subsequent edits.
 - The running application displays the resulting inventory after cleanup and restoration.
 
-## Decisions awaiting approval
+## Deployment requirement
 
-- Whether timing association is the intended meaning of a better match.
-- Whether forced subtitles remain separate from full-dialogue subtitles within each language.
-- The production authorization boundary and coordination with independent media writers.
+Production still needs an external authorization boundary and coordination with independent media writers.
 
 Filename guesses, synthetic maximum scores, raw synchronization scores, and simple duration-overlap rankings are rejected.

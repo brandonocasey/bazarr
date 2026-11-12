@@ -10,6 +10,7 @@ from app.database import (TableShows, TableEpisodes, TableMovies, database, sele
                           is_indexed_subtitle_path)
 from utilities.path_mappings import path_mappings
 from utilities.video_analyzer import subtitles_sync_references
+from utilities.media_write_lock import media_write_lock, subtitle_media_path
 from subtitles.tools.translate.main import translate_subtitles_file, extract_and_translate_embedded
 from subtitles.tools.translate.core.translator_utils import resolve_translation_source
 from subtitles.tools.mods import subtitles_apply_mods
@@ -277,6 +278,13 @@ class Subtitles(Resource):
 
 
 def postprocess_subtitles(subtitles_path, media_type, metadata, id):
+    mapper = path_mappings.path_replace if media_type == 'episode' else path_mappings.path_replace_movie
+    video = mapper(metadata.path)
+    with media_write_lock(subtitle_media_path(subtitles_path, video_path=video, allow_unindexed=True)):
+        return _postprocess_subtitles(subtitles_path, media_type, metadata, id)
+
+
+def _postprocess_subtitles(subtitles_path, media_type, metadata, id):
     # apply chmod if required
     chmod = int(settings.general.chmod, 8) if not sys.platform.startswith('win') and settings.general.chmod_enabled else None
     if chmod:

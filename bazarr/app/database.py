@@ -140,6 +140,19 @@ class TableAnnouncements(Base):
     text = mapped_column(Text)
 
 
+class TableSubtitleCleanupOperations(Base):
+    __tablename__ = 'table_subtitle_cleanup_operations'
+
+    id = mapped_column(Text, primary_key=True)
+    media_type = mapped_column(Text, nullable=False)
+    media_id = mapped_column(Integer, nullable=False)
+    video_path = mapped_column(Text, nullable=False, index=True)
+    status = mapped_column(Text, nullable=False)
+    job_id = mapped_column(Integer, nullable=True)
+    payload = mapped_column(Text, nullable=False)
+    created_at = mapped_column(DateTime, nullable=False, default=datetime.now)
+
+
 class TableBlacklist(Base):
     __tablename__ = 'table_blacklist'
 

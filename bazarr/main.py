@@ -59,6 +59,9 @@ else:
     upgrade_languages_profile_values()
     fix_languages_profiles_with_duplicate_ids()
 
+from subtitles.cleanup.service import recover_interrupted_operations
+recover_interrupted_operations()
+
 configure_sz_ssl_verify_func()
 
 configure_proxy_func()
