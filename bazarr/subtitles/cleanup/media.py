@@ -328,6 +328,7 @@ def _ebml_elements(source: BinaryIO, end: int, cancelled: CancelCheck) -> Iterat
         size_width = source.tell() - size_start
         if identity is None or size is None:
             raise ValueError('Cannot read Matroska segment identity element')
+        # All-one size data denotes unknown length: https://www.rfc-editor.org/rfc/rfc8794.html#section-6.2
         if size == (1 << (7 * size_width)) - 1:
             if identity != 0x18538067:
                 raise ValueError('Cannot verify segment identities past an unknown-size Matroska element')
@@ -340,6 +341,7 @@ def _ebml_elements(source: BinaryIO, end: int, cancelled: CancelCheck) -> Iterat
         source.seek(element_end)
 
 
+# Matroska element identifiers: https://www.matroska.org/technical/elements.html
 _SEGMENT_LINK_FIELDS = {
     0x73A4: ('SegmentUID', 'uid'), 0x7384: ('SegmentFilename', 'string'),
     0x3CB923: ('PreviousSegmentUID', 'uid'), 0x3C83AB: ('PreviousSegmentFilename', 'string'),
