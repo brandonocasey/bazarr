@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from subtitles.cleanup.media import analyze_media, prepare_outputs, source_paths
-from subtitles.cleanup.models import ExternalSubtitle, MediaAnalysis
+from subtitles.cleanup.models import AnalysisOptions, ExternalSubtitle, MediaAnalysis
 
 
 def run(*args):
@@ -100,7 +100,7 @@ def test_stale_input_unknown_keeper_and_cancellation_never_stage_replacement(med
         prepare_outputs(analysis, [], str(tmp_path / 'stage'))
     from concurrent.futures import CancelledError
     with pytest.raises(CancelledError):
-        analyze_media(str(video), [], str(tmp_path / 'cancelled'), cancelled=lambda: True)
+        analyze_media(str(video), [], str(tmp_path / 'cancelled'), AnalysisOptions(cancelled=lambda: True))
 
 
 @pytest.fixture
@@ -181,17 +181,17 @@ def test_selected_audio_is_shared_and_silent_reference_remains_unrankable(media,
     silent = analyze_media(str(dual), external, str(tmp_path / 'silent'))
     assert silent.audio_stream_index == 2
     assert all(track.score is None and 'constant' in track.error for track in silent.tracks)
-    audible = analyze_media(str(dual), external, str(tmp_path / 'audible'), audio_stream_index=1)
+    audible = analyze_media(str(dual), external, str(tmp_path / 'audible'), AnalysisOptions(audio_stream_index=1))
     assert audible.audio_stream_index == 1
     assert all(track.score is not None for track in audible.tracks)
     equal_timing = [track.score for track in audible.tracks if track.codec == 'hdmv_pgs_subtitle' or track.source == 'external']
     assert equal_timing[0] == pytest.approx(equal_timing[1])
     assert all(track.language == 'eng' for track in audible.tracks)
     with pytest.raises(ValueError, match='does not exist'):
-        analyze_media(str(dual), external, str(tmp_path / 'invalid'), audio_stream_index=0)
+        analyze_media(str(dual), external, str(tmp_path / 'invalid'), AnalysisOptions(audio_stream_index=0))
 
 
-@pytest.mark.parametrize('damage,reason', [('metadata', 'metadata'), ('attachment', 'lost or added'), ('timing', 'presentation timestamps'), ('edition', 'Matroska tags or chapter editions')])
+@pytest.mark.parametrize('damage,reason', [('metadata', 'metadata'), ('attachment', 'lost or added'), ('timing', 'presentation timestamps'), ('edition', 'Matroska tags or chapter editions'), ('segment', 'segment identities')])
 def test_prepare_rejects_successful_but_lossy_tool_output(media, tmp_path, monkeypatch, damage, reason):
     import os
     import shutil
@@ -216,6 +216,8 @@ if '-o' in sys.argv:
         subprocess.run([{real_edit!r}, output, '--edit', 'info', '--set', 'title=Damaged'], check=True)
     elif {damage!r} == 'attachment':
         subprocess.run([{real_edit!r}, output, '--delete-attachment', '1'], check=True)
+    elif {damage!r} == 'segment':
+        subprocess.run([{real_edit!r}, output, '--edit', 'info', '--set', 'segment-uid=00112233445566778899aabbccddeeff'], check=True)
     elif {damage!r} == 'edition':
         import xml.etree.ElementTree as ET
         document = ET.fromstring(subprocess.check_output([{real_extract!r}, output, 'chapters']))
@@ -280,3 +282,113 @@ def test_microdvd_without_explicit_frame_rate_is_never_scored_using_a_guessed_ra
     assert by_name[known.name].score == pytest.approx(by_name[first.name].score), by_name[known.name].error
     assert by_name[unknown.name].score is None
     assert 'no explicit frame rate' in by_name[unknown.name].error
+
+
+@pytest.mark.parametrize('linked', [False, True])
+def test_matroska_segment_identity_survives_subtitle_removal(media, tmp_path, linked):
+    video = media[0]
+    if linked:
+        segment_info = tmp_path / 'segment-info.xml'
+        segment_info.write_text('<Info><SegmentUID format="hex">00112233445566778899aabbccddeeff</SegmentUID>'
+                                '<PreviousSegmentUID format="hex">112233445566778899aabbccddeeff00</PreviousSegmentUID>'
+                                '<NextSegmentUID format="hex">2233445566778899aabbccddeeff0011</NextSegmentUID>'
+                                '<SegmentFamily format="hex">33445566778899aabbccddeeff001122</SegmentFamily>'
+                                '<SegmentFilename>Film ü ; v1.2.mkv</SegmentFilename>'
+                                '<PreviousSegmentFilename>previous.mkv</PreviousSegmentFilename>'
+                                '<NextSegmentFilename>next.mkv</NextSegmentFilename></Info>')
+        linked_video = tmp_path / 'linked.mkv'
+        run('mkvmerge', '--segmentinfo', str(segment_info), '-o', str(linked_video), str(video))
+        video = linked_video
+    before = digest(video)
+    identity = json.loads(run('mkvmerge', '-J', str(video)))['container']['properties']
+    analysis = analyze_media(str(video), [], str(tmp_path / 'analysis'))
+    keep = [track.key for track in analysis.tracks if track.codec == 'hdmv_pgs_subtitle']
+    output = prepare_outputs(analysis, keep, str(tmp_path / 'stage'))[0].staged_path
+    actual = json.loads(run('mkvmerge', '-J', output))['container']['properties']
+    for key in ('segment_uid', 'previous_segment_uid', 'next_segment_uid'):
+        assert actual.get(key) == identity.get(key), key
+    if linked:
+        details = run('mkvinfo', '--ui-language', 'en_US', output).decode()
+        original_details = run('mkvinfo', '--ui-language', 'en_US', str(video)).decode()
+        names = ('Segment UID:', 'Previous segment UID:', 'Next segment UID:', 'Family UID:',
+                 'Segment filename:', 'Previous filename:', 'Next filename:')
+        assert all(name in original_details for name in names)
+        assert [line for line in details.splitlines() if any(name in line for name in names)] == [
+            line for line in original_details.splitlines() if any(name in line for name in names)]
+    assert digest(video) == before
+
+
+@pytest.mark.parametrize('outcome', ['success', 'failure', 'cancel'])
+def test_analysis_removes_only_owned_ephemeral_audio_on_every_exit(media, tmp_path, outcome):
+    from concurrent.futures import CancelledError
+
+    video = media[0]
+    workspace = tmp_path / 'analysis'
+    caller_directory = workspace / 'analysis-caller-owned'
+    caller_directory.mkdir(parents=True)
+    caller_audio = caller_directory / 'reference.pcm'
+    caller_audio.write_bytes(b'caller-owned')
+    report = workspace / 'report.json'
+    report.write_text('{"keep": true}')
+    before = digest(video)
+
+    def cancel_after_extraction():
+        return any(path != caller_audio for path in workspace.glob('analysis-*/reference.pcm'))
+
+    external = [ExternalSubtitle(str(tmp_path / 'missing.srt'), 'eng')] if outcome == 'failure' else []
+    if outcome == 'success':
+        assert analyze_media(str(video), external, str(workspace)).tracks
+    else:
+        with pytest.raises(CancelledError if outcome == 'cancel' else FileNotFoundError):
+            analyze_media(str(video), external, str(workspace),
+                          AnalysisOptions(cancelled=cancel_after_extraction if outcome == 'cancel' else None))
+    assert set(workspace.iterdir()) == {caller_directory, report}
+    assert caller_audio.read_bytes() == b'caller-owned'
+    assert report.read_text() == '{"keep": true}'
+    assert digest(video) == before
+
+
+def test_matroska_chapter_translation_and_repeated_families_survive_removal(media, tmp_path):
+    video = media[0]
+    info = tmp_path / 'translated.xml'
+    info.write_text('<Info><SegmentFamily format="hex">00112233445566778899aabbccddeeff</SegmentFamily>'
+                    '<SegmentFamily format="hex">112233445566778899aabbccddeeff00</SegmentFamily>'
+                    '<ChapterTranslate><ChapterTranslateEditionUID>1234</ChapterTranslateEditionUID>'
+                    '<ChapterTranslateCodec>0</ChapterTranslateCodec>'
+                    '<ChapterTranslateID format="hex">012345</ChapterTranslateID></ChapterTranslate></Info>')
+    translated = tmp_path / 'translated.mkv'
+    run('mkvmerge', '-o', str(translated), '--segmentinfo', str(info), str(video))
+    before = run('mkvinfo', '--ui-language', 'en_US', str(translated)).decode()
+    analysis = analyze_media(str(translated), [], str(tmp_path / 'analysis'))
+    output = prepare_outputs(analysis, [analysis.tracks[-1].key], str(tmp_path / 'stage'))[0].staged_path
+    after = run('mkvinfo', '--ui-language', 'en_US', output).decode()
+    names = ('Family UID:', 'Chapter translate', 'Chapter translate edition UID:',
+             'Chapter translate codec:', 'Chapter translate ID:')
+    assert all(name in before for name in names)
+    assert [line for line in after.splitlines() if any(name in line for name in names)] == [
+        line for line in before.splitlines() if any(name in line for name in names)]
+
+
+def test_failed_audio_decoder_removes_partial_pcm_and_preserves_error(media, tmp_path, monkeypatch):
+    import os
+    import shutil
+    import sys
+
+    workspace = tmp_path / 'analysis'
+    binaries = tmp_path / 'binaries'
+    binaries.mkdir()
+    wrapper = binaries / 'ffmpeg'
+    real_ffmpeg = shutil.which('ffmpeg')
+    wrapper.write_text(f'''#!{sys.executable}
+import subprocess
+import sys
+subprocess.run([{real_ffmpeg!r}, *sys.argv[1:]], check=True)
+if '-i' in sys.argv:
+    sys.stderr.write('injected decoder failure after writing PCM')
+    sys.exit(1)
+''')
+    wrapper.chmod(0o755)
+    monkeypatch.setenv('PATH', str(binaries) + os.pathsep + os.defpath)
+    analysis = analyze_media(str(media[0]), [], str(workspace))
+    assert all(track.score is None and 'injected decoder failure' in track.error for track in analysis.tracks)
+    assert not list(workspace.iterdir())

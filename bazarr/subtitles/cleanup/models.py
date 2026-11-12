@@ -1,7 +1,14 @@
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Literal, TypeAlias
 
 JSONValue: TypeAlias = str | int | float | bool | None | list['JSONValue'] | dict[str, 'JSONValue']
+
+
+@dataclass(frozen=True)
+class AnalysisOptions:
+    audio_stream_index: int | None = None
+    cancelled: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True)

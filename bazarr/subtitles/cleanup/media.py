@@ -8,15 +8,31 @@ import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from concurrent.futures import CancelledError
 from pathlib import Path
 from typing import BinaryIO, Literal
 
-from .models import AudioStream, ExternalSubtitle, JSONValue, MediaAnalysis, PreparedFile, SubtitleTrack
+from .models import AnalysisOptions, AudioStream, ExternalSubtitle, JSONValue, MediaAnalysis, PreparedFile, SubtitleTrack
 from .scoring import FRAME_SECONDS, SAMPLE_RATE, VAD_MODE, display_signal, pearson_score
 
 CancelCheck = Callable[[], bool] | None
+
+
+@dataclass(frozen=True)
+class _SignalOptions:
+    duration: float
+    cancelled: CancelCheck = None
+    bitmap: bool = False
+
+
+@dataclass(frozen=True)
+class _VobSubOptions:
+    original: Path
+    retained_indices: list[int]
+    track_ids: list[int]
+    cancelled: CancelCheck = None
 
 
 def _check(cancelled: CancelCheck) -> None:
@@ -136,8 +152,8 @@ def _paired_path(path: Path, extension: str) -> Path:
     return path.with_suffix(extension.upper() if path.suffix.isupper() else extension)
 
 
-def _events(path: str, stream_index: int, duration: float, bitmap: bool,
-            cancelled: CancelCheck) -> list[tuple[float, float]]:
+def _events(path: str, stream_index: int, options: _SignalOptions) -> list[tuple[float, float]]:
+    duration, cancelled, bitmap = options.duration, options.cancelled, options.bitmap
     data = _object(json.loads(_run([_tool('ffprobe'), '-v', 'error', '-select_streams', str(stream_index),
                                    '-show_frames', '-of', 'json', *_subtitle_input_format(path), path], cancelled)))
     intervals: list[tuple[float, float]] = []
@@ -165,28 +181,43 @@ def _events(path: str, stream_index: int, duration: float, bitmap: bool,
     return intervals
 
 
-def _audio_signal(path: str, index: int, duration: float, workspace: Path,
-                  cancelled: CancelCheck) -> list[float]:
+def _audio_signal(path: str, index: int, workspace: Path, options: _SignalOptions) -> list[float]:
     import webrtcvad
 
-    pcm = workspace / 'reference.pcm'
-    _run([_tool('ffmpeg'), '-v', 'error', '-nostdin', '-copyts', '-i', path, '-map', f'0:{index}',
-          '-vn', '-sn', '-af', f'aresample={SAMPLE_RATE}:async=1:first_pts=0', '-ac', '1',
-          '-ar', str(SAMPLE_RATE), '-t', str(duration), '-f', 's16le', '-n', str(pcm)], cancelled)
-    vad = webrtcvad.Vad(VAD_MODE)
-    frame_bytes = SAMPLE_RATE // 100 * 2
-    count = math.ceil(duration / FRAME_SECONDS)
-    signal: list[float] = []
-    with pcm.open('rb') as audio:
-        for _ in range(count):
-            _check(cancelled)
-            frame = audio.read(frame_bytes)
-            signal.append(float(vad.is_speech(frame.ljust(frame_bytes, b'\0'), SAMPLE_RATE)) if frame else 0.0)
-    return signal
+    duration, cancelled = options.duration, options.cancelled
+    _require_space(workspace, math.ceil(duration * SAMPLE_RATE * 2))
+    with tempfile.TemporaryDirectory(prefix='analysis-', dir=workspace) as directory:
+        pcm = Path(directory) / 'reference.pcm'
+        _run([_tool('ffmpeg'), '-v', 'error', '-nostdin', '-copyts', '-i', path, '-map', f'0:{index}',
+              '-vn', '-sn', '-af', f'aresample={SAMPLE_RATE}:async=1:first_pts=0', '-ac', '1',
+              '-ar', str(SAMPLE_RATE), '-t', str(duration), '-f', 's16le', '-n', str(pcm)], cancelled)
+        vad = webrtcvad.Vad(VAD_MODE)
+        frame_bytes = SAMPLE_RATE // 100 * 2
+        count = math.ceil(duration / FRAME_SECONDS)
+        signal: list[float] = []
+        with pcm.open('rb') as audio:
+            for _ in range(count):
+                _check(cancelled)
+                frame = audio.read(frame_bytes)
+                signal.append(float(vad.is_speech(frame.ljust(frame_bytes, b'\0'), SAMPLE_RATE)) if frame else 0.0)
+        return signal
+
+
+def _select_audio_stream(probe: dict[str, JSONValue], audio_stream_index: int | None) -> tuple[list[AudioStream], int | None]:
+    audio_streams = [AudioStream(int(str(stream['index'])), _tags(stream).get('language', 'und'),
+                                _tags(stream).get('title', ''), bool(_flags(stream).get('default', 0)))
+                     for stream in _streams(probe) if stream.get('codec_type') == 'audio']
+    if audio_stream_index is None and audio_streams:
+        audio_stream_index = next((stream.index for stream in audio_streams if stream.default), audio_streams[0].index)
+    if audio_stream_index is not None and audio_stream_index not in {stream.index for stream in audio_streams}:
+        raise ValueError('Selected audio stream does not exist')
+    return audio_streams, audio_stream_index
 
 
 def analyze_media(video_path: str, external_subtitles: Iterable[ExternalSubtitle], workspace: str,
-                  audio_stream_index: int | None = None, cancelled: CancelCheck = None) -> MediaAnalysis:
+                  options: AnalysisOptions | None = None) -> MediaAnalysis:
+    options = options or AnalysisOptions()
+    audio_stream_index, cancelled = options.audio_stream_index, options.cancelled
     video_path = str(Path(video_path).resolve(strict=True))
     initial_inputs = {video_path: _digest(video_path, cancelled)}
     workspace_path = Path(workspace)
@@ -195,20 +226,12 @@ def analyze_media(video_path: str, external_subtitles: Iterable[ExternalSubtitle
     duration = float(str(_object(probe.get('format', {})).get('duration', 0)))
     if duration <= 0 or not math.isfinite(duration):
         raise ValueError('Media has no finite positive presentation duration')
-    _require_space(workspace_path, math.ceil(duration * SAMPLE_RATE * 2))
-    stage = Path(tempfile.mkdtemp(prefix='analysis-', dir=workspace_path))
-    audio_streams = [AudioStream(int(str(stream['index'])), _tags(stream).get('language', 'und'),
-                                _tags(stream).get('title', ''), bool(_flags(stream).get('default', 0)))
-                     for stream in _streams(probe) if stream.get('codec_type') == 'audio']
-    if audio_stream_index is None and audio_streams:
-        audio_stream_index = next((stream.index for stream in audio_streams if stream.default), audio_streams[0].index)
-    if audio_stream_index is not None and audio_stream_index not in {stream.index for stream in audio_streams}:
-        raise ValueError('Selected audio stream does not exist')
+    audio_streams, audio_stream_index = _select_audio_stream(probe, audio_stream_index)
     reference: list[float] | None = None
     audio_error = 'Media has no audio stream'
     if audio_stream_index is not None:
         try:
-            reference = _audio_signal(video_path, audio_stream_index, duration, stage, cancelled)
+            reference = _audio_signal(video_path, audio_stream_index, workspace_path, _SignalOptions(duration, cancelled))
         except (RuntimeError, ValueError) as error:
             audio_error = str(error)
     tracks: list[SubtitleTrack] = []
@@ -258,7 +281,7 @@ def analyze_media(video_path: str, external_subtitles: Iterable[ExternalSubtitle
                     header = subtitle.read(256).decode('ascii', errors='replace')
                 if re.match(r'(?:\{1\}\{1\}|\{0\}\{0\})\d+(?:\.\d+)?(?:\r?\n|$)', header) is None:
                     raise ValueError('MicroDVD timing has no explicit frame rate; an assumed frame rate cannot be scored')
-            intervals = _events(path, index, duration, codec in ('hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle'), cancelled)
+            intervals = _events(path, index, _SignalOptions(duration, cancelled, codec in ('hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle')))
             if reference is not None:
                 score, error_message = pearson_score(reference, display_signal(intervals, duration))
         except (RuntimeError, ValueError) as error:
@@ -294,6 +317,89 @@ def source_paths(analysis: MediaAnalysis) -> list[str]:
                    *(str(path) for path in companions)})
 
 
+def _ebml_elements(source: BinaryIO, end: int, cancelled: CancelCheck) -> Iterator[tuple[int, int]]:
+    from enzyme.parsers.ebml import read_element_id, read_element_size
+
+    while source.tell() < end:
+        _check(cancelled)
+        identity = read_element_id(source)
+        size_start = source.tell()
+        size = read_element_size(source)
+        size_width = source.tell() - size_start
+        if identity is None or size is None:
+            raise ValueError('Cannot read Matroska segment identity element')
+        if size == (1 << (7 * size_width)) - 1:
+            if identity != 0x18538067:
+                raise ValueError('Cannot verify segment identities past an unknown-size Matroska element')
+            element_end = end
+        else:
+            element_end = source.tell() + size
+        if element_end > end:
+            raise ValueError('Matroska segment identity element exceeds its parent')
+        yield identity, element_end
+        source.seek(element_end)
+
+
+_SEGMENT_LINK_FIELDS = {
+    0x73A4: ('SegmentUID', 'uid'), 0x7384: ('SegmentFilename', 'string'),
+    0x3CB923: ('PreviousSegmentUID', 'uid'), 0x3C83AB: ('PreviousSegmentFilename', 'string'),
+    0x3EB923: ('NextSegmentUID', 'uid'), 0x3E83BB: ('NextSegmentFilename', 'string'),
+    0x4444: ('SegmentFamily', 'uid'), 0x6924: ('ChapterTranslate', 'master'),
+    0x69FC: ('ChapterTranslateEditionUID', 'integer'), 0x69BF: ('ChapterTranslateCodec', 'integer'),
+    0x69A5: ('ChapterTranslateID', 'binary'),
+}
+
+
+def _segment_link_field(source: BinaryIO, identity: int, end: int, cancelled: CancelCheck) -> ET.Element:
+    name, kind = _SEGMENT_LINK_FIELDS[identity]
+    element = ET.Element(name)
+    if kind == 'master':
+        element.extend(_segment_link_fields(source, end, cancelled))
+        return element
+    size = end - source.tell()
+    if kind == 'uid' and size != 16:
+        raise ValueError('Matroska segment link UID must contain exactly 16 bytes')
+    if kind == 'integer' and not 1 <= size <= 8:
+        raise ValueError('Invalid Matroska chapter translation integer')
+    data = source.read(size)
+    if len(data) != size:
+        raise ValueError('Truncated Matroska segment identity')
+    if kind == 'string':
+        element.text = data.decode('utf-8').rstrip('\0')
+    elif kind == 'integer':
+        element.text = str(int.from_bytes(data, 'big'))
+    else:
+        element.set('format', 'hex')
+        element.text = data.hex()
+    return element
+
+
+def _segment_link_fields(source: BinaryIO, end: int, cancelled: CancelCheck) -> list[ET.Element]:
+    result = [_segment_link_field(source, identity, element_end, cancelled)
+              for identity, element_end in _ebml_elements(source, end, cancelled) if identity in _SEGMENT_LINK_FIELDS]
+    return result
+
+
+def _segment_info_from_segment(source: BinaryIO, end: int, cancelled: CancelCheck) -> ET.Element:
+    infos = [_segment_link_fields(source, child_end, cancelled)
+             for child_id, child_end in _ebml_elements(source, end, cancelled) if child_id == 0x1549A966]
+    if len(infos) != 1:
+        raise ValueError('Cannot preserve Matroska identities without exactly one Info element')
+    result = ET.Element('Info')
+    result.extend(sorted(infos[0], key=lambda element: ET.tostring(element)))
+    return result
+
+
+def _segment_info(path: str, cancelled: CancelCheck) -> ET.Element:
+    with open(path, 'rb') as source:
+        segments = [_segment_info_from_segment(source, segment_end, cancelled)
+                    for identity, segment_end in _ebml_elements(source, Path(path).stat().st_size, cancelled)
+                    if identity == 0x18538067]
+    if len(segments) != 1:
+        raise ValueError('Cannot preserve identities without exactly one Matroska segment')
+    return segments[0]
+
+
 def _mkv_tracks(path: str, cancelled: CancelCheck) -> list[dict[str, JSONValue]]:
     return _objects(_object(json.loads(_run([_tool('mkvmerge'), '-J', path], cancelled))).get('tracks', []))
 
@@ -311,6 +417,17 @@ def _mkv_mapping(path: str, probe: dict[str, JSONValue], cancelled: CancelCheck)
     return mapping
 
 
+def _normalize_vobsub_input(path: str, directory: Path) -> str:
+    if Path(path).suffix != '.IDX':
+        return path
+    normalized = directory / 'vobsub-input'
+    normalized.mkdir()
+    input_path = str(normalized / 'source.idx')
+    shutil.copyfile(path, input_path)
+    shutil.copyfile(_paired_path(Path(path), '.sub'), normalized / 'source.sub')
+    return input_path
+
+
 def _remux(path: str, output: Path, remove: set[int], cancelled: CancelCheck) -> None:
     probe = _probe(path, cancelled)
     streams = _streams(probe)
@@ -319,16 +436,14 @@ def _remux(path: str, output: Path, remove: set[int], cancelled: CancelCheck) ->
     retained = [stream for stream in streams if int(str(stream['index'])) not in remove]
     matroska = 'matroska' in str(_object(probe.get('format', {})).get('format_name', ''))
     if matroska or Path(path).suffix.lower() == '.idx':
-        input_path = path
-        if Path(path).suffix == '.IDX':
-            normalized = output.parent / 'vobsub-input'
-            normalized.mkdir()
-            input_path = str(normalized / 'source.idx')
-            shutil.copyfile(path, input_path)
-            shutil.copyfile(_paired_path(Path(path), '.sub'), normalized / 'source.sub')
+        input_path = _normalize_vobsub_input(path, output.parent)
         mapping = _mkv_mapping(input_path, probe, cancelled)
         subtitle_ids = [mapping[int(str(stream['index']))] for stream in retained if stream.get('codec_type') == 'subtitle']
         arguments = [_tool('mkvmerge'), '--no-date', '-o', str(output)]
+        if matroska:
+            segment_info = output.parent / 'segment-info.xml'
+            ET.ElementTree(_segment_info(path, cancelled)).write(segment_info, encoding='utf-8', xml_declaration=True)
+            arguments += ['--segmentinfo', str(segment_info)]
         arguments += ['--subtitle-tracks', ','.join(map(str, subtitle_ids))] if subtitle_ids else ['--no-subtitles']
         flag_names = {'default': 'default', 'forced': 'forced-display', 'hearing_impaired': 'hearing-impaired',
                       'visual_impaired': 'visual-impaired', 'descriptions': 'text-descriptions',
@@ -397,7 +512,7 @@ def _xml_state(element: ET.Element) -> JSONValue:
 
 
 def _matroska_metadata(path: str, removed_uids: set[str], cancelled: CancelCheck) -> dict[str, JSONValue]:
-    result: dict[str, JSONValue] = {}
+    result: dict[str, JSONValue] = {'segment_info': _xml_state(_segment_info(path, cancelled))}
     statistics = {'BPS', 'DURATION', 'NUMBER_OF_FRAMES', 'NUMBER_OF_BYTES', '_STATISTICS_WRITING_APP',
                   '_STATISTICS_WRITING_DATE_UTC', '_STATISTICS_TAGS'}
     for kind in ('tags', 'chapters'):
@@ -447,7 +562,7 @@ def _verify(original: str, staged: str, remove: set[int], cancelled: CancelCheck
         if source.get('codec_type') == 'subtitle':
             duration = float(str(_object(before.get('format', {})).get('duration', 0)))
             bitmap = source.get('codec_name') in ('dvd_subtitle', 'hdmv_pgs_subtitle', 'dvb_subtitle')
-            if _events(original, old_index, duration, bitmap, cancelled) != _events(staged, new_index, duration, bitmap, cancelled):
+            if _events(original, old_index, _SignalOptions(duration, cancelled, bitmap)) != _events(staged, new_index, _SignalOptions(duration, cancelled, bitmap)):
                 raise ValueError(f'Staged replacement changed retained subtitle {old_index} display timing')
     if 'matroska' in str(_object(before.get('format', {})).get('format_name', '')):
         track_mapping = _mkv_mapping(original, before, cancelled)
@@ -455,7 +570,7 @@ def _verify(original: str, staged: str, remove: set[int], cancelled: CancelCheck
         removed_uids = {str(_object(track.get('properties', {})).get('uid'))
                         for track in _mkv_tracks(original, cancelled) if int(str(track['id'])) in removed_ids}
         if _matroska_metadata(original, removed_uids, cancelled) != _matroska_metadata(staged, set(), cancelled):
-            raise ValueError('Staged replacement changed Matroska tags or chapter editions')
+            raise ValueError('Staged replacement changed Matroska tags or chapter editions or segment identities')
     if _semantic_tags(_object(before.get('format', {}))) != _semantic_tags(_object(after.get('format', {}))):
         raise ValueError('Staged replacement changed global metadata')
     chapters_before, chapters_after = _objects(before.get('chapters', [])), _objects(after.get('chapters', []))
@@ -505,8 +620,9 @@ def _copy_vobsub(source: Path, destination: BinaryIO, stream_id: int, cancelled:
     return written
 
 
-def _extract_vobsub(original: Path, retained_indices: list[int], intermediate: Path, output: Path,
-                    track_ids: list[int], cancelled: CancelCheck) -> None:
+def _extract_vobsub(intermediate: Path, output: Path, options: _VobSubOptions) -> None:
+    original, retained_indices = options.original, options.retained_indices
+    track_ids, cancelled = options.track_ids, options.cancelled
     extracted = [output.parent / f'language-{index}.idx' for index in range(len(track_ids))]
     _run([_tool('mkvextract'), str(intermediate), 'tracks',
           *(f'{track_id}:{path}' for track_id, path in zip(track_ids, extracted))], cancelled)
@@ -552,6 +668,20 @@ def _extract_vobsub(original: Path, retained_indices: list[int], intermediate: P
     output.write_text('\n'.join(sections) + '\n', encoding='utf-8')
 
 
+def _staging_directory(by_path: dict[str, list[SubtitleTrack]], keep: set[str], workspace: str) -> Path:
+    workspace_path = Path(workspace)
+    workspace_path.mkdir(parents=True, exist_ok=True)
+    rewritten_paths = {path for path, tracks in by_path.items()
+                       if any(track.key not in keep for track in tracks)
+                       and (tracks[0].source == 'embedded' or any(track.key in keep for track in tracks))}
+    staged_sources = rewritten_paths | {companion for path in rewritten_paths
+                                       for track in by_path[path] for companion in track.companion_paths}
+    required_bytes = 6 * sum(Path(path).stat().st_size for path in staged_sources)
+    if required_bytes:
+        _require_space(workspace_path, required_bytes)
+    return Path(tempfile.mkdtemp(prefix='prepared-', dir=workspace_path)) if rewritten_paths else workspace_path
+
+
 def prepare_outputs(analysis: MediaAnalysis, keep_keys: Iterable[str], workspace: str,
                     cancelled: CancelCheck = None) -> list[PreparedFile]:
     keep = set(keep_keys)
@@ -564,13 +694,10 @@ def prepare_outputs(analysis: MediaAnalysis, keep_keys: Iterable[str], workspace
             raise ValueError(f'Input changed after analysis: {path}')
     if keep == known:
         return []
-    workspace_path = Path(workspace)
-    workspace_path.mkdir(parents=True, exist_ok=True)
-    _require_space(workspace_path, 6 * sum(Path(path).stat().st_size for path in source_paths(analysis)))
-    stage = Path(tempfile.mkdtemp(prefix='prepared-', dir=workspace_path))
     by_path: dict[str, list[SubtitleTrack]] = {}
     for track in analysis.tracks:
         by_path.setdefault(track.path, []).append(track)
+    stage = _staging_directory(by_path, keep, workspace)
     prepared: list[PreparedFile] = []
     for path, tracks in by_path.items():
         _check(cancelled)
@@ -591,9 +718,8 @@ def prepare_outputs(analysis: MediaAnalysis, keep_keys: Iterable[str], workspace
             _remux(path, intermediate, removed, cancelled)
             mapping = _mkv_mapping(str(intermediate), _probe(str(intermediate), cancelled), cancelled)
             output = output_dir / source.name
-            _extract_vobsub(source, [track.stream_index for track in retained], intermediate, output,
-                            list(mapping.values()), cancelled)
-            # Verify against the confirmed original as well as the temporary Matroska stream.
+            _extract_vobsub(intermediate, output, _VobSubOptions(
+                source, [track.stream_index for track in retained], list(mapping.values()), cancelled))
             _verify(path, str(output), removed, cancelled)
             prepared.extend([PreparedFile(path, str(output)),
                              PreparedFile(str(_paired_path(source, '.sub')), str(_paired_path(output, '.sub')))])
