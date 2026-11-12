@@ -117,15 +117,10 @@ Preview details show the backup location when available.
 A missing location is labeled unavailable.
 Review required free space before confirming.
 
-Cleanup uses a new speech-timing Pearson correlation (-1 to 1).
-Historical download match percentages are shown separately.
-Within each language and forced-caption group, normal and hearing-impaired tracks compete.
-Fully rankable groups allow only a highest-scoring keeper.
+Read the [timing score and cleanup safeguards](../docs/redundant-subtitle-cleanup-design.md)
+before selecting keepers.
+Make an explicit choice for tied or unrankable groups.
+Create another preview after changing the audio reference or source files.
 
-Tied maxima and groups containing unrankable tracks require an explicit choice.
-Timing cannot establish translation quality, completeness, language correctness or actual redundancy.
-Changing the audio reference requires another preview.
-Refreshing an operation clears confirmation, including when the same preview returns.
-
-The server refuses stale previews and changed files.
-Restore refuses to overwrite later edits.
+Confirm again after refreshing an operation.
+Check for later edits before restoring a backup.
