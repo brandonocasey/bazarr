@@ -81,6 +81,8 @@ Unsupported versions or preservation failures must leave originals intact and re
 14. Reindex rewritten streams and show the actual resulting subtitle inventory.
 
 Queued extraction rechecks its selected subtitle and media file after acquiring the lock.
+Writer versions reject extraction selections overlapping active or interrupted writes, even after reindexing.
+Subtitle IDs identify the current inventory; they do not preserve earlier selections after completed cleanup.
 
 Multiple file replacements are not one atomic operation.
 The journal and recovery protocol must handle partial commits.

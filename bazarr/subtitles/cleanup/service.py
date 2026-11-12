@@ -240,7 +240,8 @@ def _fail(operation: Operation, error: Exception) -> None:
     logging.exception('Subtitle cleanup operation %s failed', operation['id'])
 
 
-def recover_for_media(video_path: str) -> None:
+def recover_for_media(video_path: str) -> bool:
+    recovered = False
     for operation in store.recovery_operations(video_path):
         directory = _directory(operation)
         journal = transactions.read_journal(directory)
@@ -251,12 +252,14 @@ def recover_for_media(video_path: str) -> None:
         if journal['phase'] == 'complete' and operation['status'] == 'restoring':
             continue
         journal = transactions.recover_transaction(directory)
+        recovered = True
         _cleanup_staging(operation)
         if journal['phase'] in ('complete', 'restored'):
             _finish(operation, journal)
         elif journal['phase'] == 'rolled_back':
             operation.update(status='failed', error='Interrupted cleanup was rolled back; create a fresh preview')
             store.update_operation(operation)
+    return recovered
 
 
 def _recover_operation(operation: Operation) -> None:

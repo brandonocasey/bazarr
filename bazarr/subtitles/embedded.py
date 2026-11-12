@@ -26,7 +26,7 @@ from sonarr.notify import notify_sonarr
 from subtitles.indexer.movies import store_subtitles_movie
 from subtitles.indexer.series import store_subtitles
 from subtitles.processing import ProcessSubtitlesResult
-from utilities.media_write_lock import media_write_lock
+from utilities.media_write_lock import media_write_lock, media_write_state
 from utilities.autopulse_webhook import call_external_webhook
 from utilities.binaries import get_binary
 from utilities.helper import get_target_folder
@@ -119,6 +119,42 @@ def _load_subtitle_record(subtitles_id, media_type):
             .first()
 
 
+def _subtitle_video_path(subtitles_id, media_type):
+    if media_type == 'episode':
+        media, subtitles, identity, mapper = (TableEpisodes, TableEpisodesSubtitles, 'sonarrEpisodeId',
+                                               path_mappings.path_replace)
+    else:
+        media, subtitles, identity, mapper = (TableMovies, TableMoviesSubtitles, 'radarrId',
+                                               path_mappings.path_replace_movie)
+    row = database.execute(select(media.path)
+                           .join(subtitles, getattr(media, identity) == getattr(subtitles, identity))
+                           .where(subtitles.id == subtitles_id)).first()
+    return mapper(row.path) if row is not None else None
+
+
+def _missing_subtitle(subtitles_id, media_type, job_id):
+    jobs_queue.update_job_name(job_id=job_id,
+                               new_job_name=f"Failed to extract a non-existing subtitles record {subtitles_id}")
+    raise SubtitlesNotFoundError(f"No {media_type} subtitles record found with id {subtitles_id}")
+
+
+def _load_extraction_snapshot(subtitles_id, media_type, job_id):
+    video_path = _subtitle_video_path(subtitles_id, media_type)
+    if video_path is None:
+        _missing_subtitle(subtitles_id, media_type, job_id)
+    writer_state = media_write_state(video_path)
+    source_identity = _media_file_identity(video_path)
+    data = _load_subtitle_record(subtitles_id, media_type)
+    if data is None:
+        _missing_subtitle(subtitles_id, media_type, job_id)
+    return data, video_path, source_identity, writer_state
+
+
+def _selected_video_path(data, media_type):
+    mapper = path_mappings.path_replace if media_type == 'episode' else path_mappings.path_replace_movie
+    return os.path.normcase(os.path.realpath(mapper(data.path)))
+
+
 def extract_embedded_subtitle(subtitles_id, media_type, job_id=None, filename_suffix=''):
     """Extract an embedded subtitles track to an external subtitles file.
 
@@ -142,12 +178,7 @@ def extract_embedded_subtitle(subtitles_id, media_type, job_id=None, filename_su
         jobs_queue.add_job_from_function("Extracting embedded subtitles", is_progress=False)
         return False
 
-    data = _load_subtitle_record(subtitles_id, media_type)
-
-    if not data:
-        jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract a non-existing subtitles record "
-                                                               f"{subtitles_id}")
-        raise SubtitlesNotFoundError(f"No {media_type} subtitles record found with id {subtitles_id}")
+    data, video_path, source_identity, writer_state = _load_extraction_snapshot(subtitles_id, media_type, job_id)
     media_title = _embedded_media_title(data, media_type)
     jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Extracting embedded subtitles for {media_title}")
 
@@ -156,19 +187,12 @@ def extract_embedded_subtitle(subtitles_id, media_type, job_id=None, filename_su
                                                                f"{subtitles_id}")
         raise NotAnEmbeddedSubtitlesError(f"Subtitles record {subtitles_id} is not an embedded track")
 
-    # Resolve the local media file path
-    if media_type == 'episode':
-        video_path = path_mappings.path_replace(data.path)
-        media_id = data.sonarrEpisodeId
-    else:
-        video_path = path_mappings.path_replace_movie(data.path)
-        media_id = data.radarrId
-
-    source_identity = _media_file_identity(video_path)
-    selected_data = _load_subtitle_record(subtitles_id, media_type)
-    with media_write_lock(video_path, job_id=job_id):
-        if (selected_data != data or _load_subtitle_record(subtitles_id, media_type) != data
-                or _media_file_identity(video_path) != source_identity):
+    media_id = data.sonarrEpisodeId if media_type == 'episode' else data.radarrId
+    with media_write_lock(video_path, job_id=job_id) as previous_writer:
+        if (writer_state.active or previous_writer != writer_state
+                or _load_subtitle_record(subtitles_id, media_type) != data
+                or _media_file_identity(video_path) != source_identity
+                or _selected_video_path(data, media_type) != os.path.normcase(os.path.realpath(video_path))):
             jobs_queue.update_job_name(job_id=job_id,
                                        new_job_name=f"Failed to extract changed embedded subtitles in {video_path}")
             raise EmbeddedSubtitlesExtractionError(

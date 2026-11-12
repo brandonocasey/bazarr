@@ -124,6 +124,21 @@ def _apply(library, operation):
     return _run(response.json)
 
 
+def test_completed_journal_recovery_invalidates_unchanged_file_selection(library):
+    from utilities.media_write_lock import media_write_lock, media_write_state
+
+    _, _, _, video, aligned, lower = library
+    completed = _apply(library, _preview(library))
+    completed['status'] = 'failed'
+    store.update_operation(completed)
+    before = _sha(video)
+    selection = media_write_state(str(video))
+    with media_write_lock(str(video)) as recovered:
+        assert recovered != selection
+        assert store.get_operation(completed['id'])['status'] == 'complete'
+    assert _sha(video) == before
+
+
 def test_preview_auth_validation_and_indexed_identity(library):
     client, headers, media_id, *_ = library
     assert client.post('/api/subtitles/cleanup/preview', json={}).status_code == 401

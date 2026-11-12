@@ -2,6 +2,7 @@
 
 import errno
 import hashlib
+import logging
 import os
 import sys
 import threading
@@ -9,7 +10,19 @@ import time
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import BinaryIO
+from uuid import uuid4
+
+
+_GENERATION_BYTES = 16
+
+
+@dataclass(frozen=True)
+class MediaWriteState:
+    """Snapshot for detecting selections that overlap another media writer."""
+    generation: bytes = b''
+    active: bool = False
 
 
 class _MediaLock:
@@ -17,19 +30,72 @@ class _MediaLock:
         self.mutex = threading.RLock()
         self.depth = 0
         self.file: BinaryIO | None = None
+        self.owner: int | None = None
+        self.state = MediaWriteState()
 
 
 _registry_mutex = threading.Lock()
 _locks: weakref.WeakValueDictionary[str, _MediaLock] = weakref.WeakValueDictionary()
-_guards: list[Callable[[str], None]] = []
+_guards: list[Callable[[str], bool | None]] = []
 
 
 def _canonical_path(path: str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
-def register_media_write_guard(callback: Callable[[str], None]) -> None:
-    """Register recovery to run under the media lock before an outermost writer starts."""
+def _lock_path(canonical: str) -> str:
+    from app.get_args import args
+
+    name = hashlib.sha256(os.fsencode(canonical)).hexdigest() + '.lock'
+    return os.path.join(args.config_dir, 'media_write_locks', name)
+
+
+def _read_write_state(file: BinaryIO) -> MediaWriteState:
+    # Byte zero remains reserved for the Windows advisory lock.
+    file.seek(1)
+    encoded = file.read(_GENERATION_BYTES + 2)
+    if not encoded:
+        return MediaWriteState()
+    if len(encoded) != _GENERATION_BYTES + 1 or encoded[-1] not in (0, 1):
+        raise OSError('Invalid media writer generation; refusing an ambiguous subtitle selection')
+    return MediaWriteState(encoded[:-1], bool(encoded[-1]))
+
+
+def media_write_state(video_path: str) -> MediaWriteState:
+    """Callers MUST capture this state before reading selected subtitle fields."""
+    canonical = _canonical_path(video_path)
+    with _registry_mutex:
+        lock = _locks.get(canonical)
+        if lock is not None and lock.owner == threading.get_ident():
+            return lock.state
+    try:
+        with open(_lock_path(canonical), 'rb') as file:
+            return _read_write_state(file)
+    except FileNotFoundError:
+        return MediaWriteState()
+
+
+def _record_write_state(file: BinaryIO, *, active: bool) -> MediaWriteState:
+    state = MediaWriteState(uuid4().bytes, active)
+    file.seek(1)
+    file.write(state.generation + bytes((active,)))
+    file.truncate(_GENERATION_BYTES + 2)
+    file.flush()
+    os.fsync(file.fileno())
+    return state
+
+
+def _finish_write_state(file: BinaryIO, failed: bool) -> None:
+    try:
+        _record_write_state(file, active=False)
+    except OSError:
+        if not failed:
+            raise
+        logging.exception('BAZARR could not finish media writer generation after the writer failed')
+
+
+def register_media_write_guard(callback: Callable[[str], bool | None]) -> None:
+    """Recovery callbacks MUST return True when selected subtitles can change."""
     with _registry_mutex:
         if callback not in _guards:
             _guards.append(callback)
@@ -77,10 +143,8 @@ def _thread_lock(lock: _MediaLock, job_id: int | None) -> Iterator[None]:
         lock.mutex.release()
 
 @contextmanager
-def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[None]:
-    """Serialize writers by canonical video path across threads and processes."""
-    from app.get_args import args
-
+def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[MediaWriteState]:
+    """Serialize writers and expose state changes before their bodies run."""
     canonical = _canonical_path(video_path)
     with _registry_mutex:
         lock = _locks.get(canonical)
@@ -92,33 +156,44 @@ def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[
         if lock.depth:
             lock.depth += 1
             try:
-                yield
+                yield lock.state
             finally:
                 lock.depth -= 1
             return
 
-        directory = os.path.join(args.config_dir, 'media_write_locks')
-        os.makedirs(directory, exist_ok=True)
+        path = _lock_path(canonical)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         # Retain lock files; unlinking them splits waiting and new writers across inodes.
-        name = hashlib.sha256(os.fsencode(canonical)).hexdigest() + '.lock'
-        with open(os.path.join(directory, name), 'a+b') as file:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o600)
+        with os.fdopen(descriptor, 'r+b') as file:
             _lock_file(file, job_id)
+            previous = _read_write_state(file)
+            current = _record_write_state(file, active=True)
             lock.file = file
             lock.depth = 1
+            lock.owner = threading.get_ident()
+            lock.state = MediaWriteState(current.generation)
+            failed = True
             try:
-                _run_write_guards(canonical, job_id)
-                yield
+                recovered = _run_write_guards(canonical, job_id)
+                yield lock.state if recovered else previous
+                failed = False
             finally:
                 lock.depth = 0
                 lock.file = None
+                lock.owner = None
+                _finish_write_state(file, failed)
 
 
-def _run_write_guards(canonical: str, job_id: int | None) -> None:
+def _run_write_guards(canonical: str, job_id: int | None) -> bool:
     with _registry_mutex:
         guards = tuple(_guards)
+    recovered = False
     for guard in guards:
-        guard(canonical)
+        if guard(canonical) is True:
+            recovered = True
     _raise_if_canceled(job_id)
+    return recovered
 
 
 def _after_fork() -> None:
