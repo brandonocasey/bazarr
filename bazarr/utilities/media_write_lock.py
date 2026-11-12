@@ -78,10 +78,7 @@ def _thread_lock(lock: _MediaLock, job_id: int | None) -> Iterator[None]:
 
 @contextmanager
 def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[None]:
-    """Serialize cooperating threads and processes by canonical video path; process termination releases locks.
-
-    Retain lock files; unlinking them can split waiting and new writers across inodes.
-    """
+    """Serialize writers by canonical video path across threads and processes."""
     from app.get_args import args
 
     canonical = _canonical_path(video_path)
@@ -102,6 +99,7 @@ def media_write_lock(video_path: str, *, job_id: int | None = None) -> Iterator[
 
         directory = os.path.join(args.config_dir, 'media_write_locks')
         os.makedirs(directory, exist_ok=True)
+        # Retain lock files; unlinking them splits waiting and new writers across inodes.
         name = hashlib.sha256(os.fsencode(canonical)).hexdigest() + '.lock'
         with open(os.path.join(directory, name), 'a+b') as file:
             _lock_file(file, job_id)
@@ -134,10 +132,7 @@ if hasattr(os, 'register_at_fork'):
 
 def subtitle_media_path(subtitle_path: str, video_path: str | None = None, *,
                         allow_unindexed: bool = False) -> str:
-    """Allow fresh sidecars before indexing, after checking their video's identity and output location.
-
-    Reject paths owned by another video, even when the filename matches.
-    """
+    """Resolve indexed ownership or validate fresh sidecars against the video and output location."""
     from app.database import (database, select, TableEpisodes, TableEpisodesSubtitles,
                               TableMovies, TableMoviesSubtitles)
     from utilities.path_mappings import path_mappings
