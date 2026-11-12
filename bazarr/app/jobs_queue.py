@@ -219,17 +219,14 @@ class JobsQueue:
             If no matches are found, an empty list is returned.
         :rtype: list[dict]
         """
-        queues = self.jobs_pending_queue + self.jobs_running_queue + self.jobs_failed_queue + self.jobs_canceled_queue + self.jobs_completed_queue
-        if status:
-            try:
-                queues = self.__dict__[f'jobs_{status}_queue']
-            except KeyError:
-                return []
-
-        if job_id:
-            return [vars(job) for job in queues if job.job_id == job_id]
-        else:
-            return [vars(job) for job in queues]
+        with self._queue_lock:
+            queues = self.jobs_pending_queue + self.jobs_running_queue + self.jobs_failed_queue + self.jobs_canceled_queue + self.jobs_completed_queue
+            if status:
+                try:
+                    queues = self.__dict__[f'jobs_{status}_queue']
+                except KeyError:
+                    return []
+            return [vars(job).copy() for job in queues if not job_id or job.job_id == job_id]
 
     def get_job_status(self, job_id: int):
         """

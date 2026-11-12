@@ -37,12 +37,24 @@ def _cancelled(job_id: int | None) -> bool:
     return job is not None and job.cancel_event.is_set()
 
 
+def _reject_enqueue(operation: Operation, function: str, message: str) -> None:
+    previous = operation['status']
+    status = {'run_analysis': 'failed', 'run_apply': 'ready', 'run_restore': 'complete'}[function]
+    operation.update(status=status, error=message)
+    store.update_operation(operation, previous=(previous,))
+
+
 def _enqueue(operation: Operation, function: str) -> Operation:
-    job_id = jobs_queue.feed_jobs_pending_queue(
-        job_name=f'Subtitle cleanup: {operation["title"]}', module=__name__, func=function,
-        kwargs={'operation_id': operation['id']}, is_progress=True, is_cancellable=True,
-    )
+    try:
+        job_id = jobs_queue.feed_jobs_pending_queue(
+            job_name=f'Subtitle cleanup: {operation["title"]}', module=__name__, func=function,
+            kwargs={'operation_id': operation['id']}, is_progress=True, is_cancellable=True,
+        )
+    except Exception as error:
+        _reject_enqueue(operation, function, f'Cannot queue cleanup: {error}')
+        raise
     if job_id is False:
+        _reject_enqueue(operation, function, 'This cleanup job is already queued; reload and retry after it finishes')
         raise store.CleanupError('This cleanup job is already queued', 409)
     return store.set_job_id(operation['id'], job_id)
 
@@ -179,6 +191,9 @@ def run_restore(operation_id: str, job_id: int | None = None) -> None:
     operation = store.get_operation(operation_id)
     try:
         with media_write_lock(operation['video_path'], job_id=job_id):
+            operation = store.get_operation(operation_id)
+            if operation['status'] != 'restoring':
+                return
             if _cancelled(job_id):
                 operation['status'] = 'complete'
                 store.update_operation(operation)

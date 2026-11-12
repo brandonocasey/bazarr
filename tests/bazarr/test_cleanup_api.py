@@ -3,6 +3,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from collections import deque
+from threading import Event, Thread
 
 import pytest
 
@@ -237,6 +239,115 @@ def test_polling_during_job_handoff_cannot_cancel_confirmed_work(library, monkey
         completed = _run(response.json)
     assert observed == ['applying' if transition == 'apply' else 'restoring']
     assert completed['status'] == ('complete' if transition == 'apply' else 'restored'), completed['error']
+
+
+def test_immediate_retry_of_refused_restore_cannot_strand_operation(library, monkeypatch):
+    client, headers, _, _, _, lower = library
+    operation = _apply(library, _preview(library))
+    lower.write_text('Later subtitles must survive')
+    update = store.update_operation
+    retries = []
+    url = f'/api/subtitles/cleanup/{operation["id"]}/restore'
+    body = {'preview_token': operation['preview_token']}
+
+    def retry_before_worker_exits(current, *args, **kwargs):
+        result = update(current, *args, **kwargs)
+        if current['status'] == 'complete' and current['error'] and not retries:
+            retries.append(None)
+            retries[0] = client.post(url, headers=headers, json=body).status_code
+        return result
+
+    monkeypatch.setattr(store, 'update_operation', retry_before_worker_exits)
+    refused = _run(client.post(url, headers=headers, json=body).json)
+    assert retries == [409]
+    assert refused['status'] == 'complete'
+    assert client.get(f'/api/subtitles/cleanup/{operation["id"]}', headers=headers).json['status'] == 'complete'
+    again = client.post(url, headers=headers, json=body)
+    assert again.status_code == 202
+    assert _run(again.json)['status'] == 'complete'
+    assert lower.read_text() == 'Later subtitles must survive'
+
+
+def test_failed_queue_publication_cannot_run_an_abandoned_restore(library, monkeypatch):
+    client, headers, _, video, _, lower = library
+    operation = _apply(library, _preview(library))
+    cleaned = _sha(video)
+    feed = jobs_queue.feed_jobs_pending_queue
+
+    def fail_after_enqueuing(*args, **kwargs):
+        feed(*args, **kwargs)
+        raise OSError('Queue event publication failed')
+
+    monkeypatch.setattr(jobs_queue, 'feed_jobs_pending_queue', fail_after_enqueuing)
+    url = f'/api/subtitles/cleanup/{operation["id"]}/restore'
+    body = {'preview_token': operation['preview_token']}
+    response = client.post(url, headers=headers, json=body)
+    assert response.status_code == 409
+    assert store.get_operation(operation['id'])['status'] == 'complete'
+    drained = _run(operation)
+    assert drained['status'] == 'complete'
+    assert _sha(video) == cleaned and not lower.exists()
+    monkeypatch.setattr(jobs_queue, 'feed_jobs_pending_queue', feed)
+    assert _run(client.post(url, headers=headers, json=body).json)['status'] == 'restored'
+
+
+def test_queue_transfer_is_invisible_to_cleanup_polling(library, monkeypatch):
+    client, headers, *_ = library
+    operation = _preview(library)
+    keepers = {group['key']: group['recommended_keeper'] for group in operation['groups']}
+    response = client.post(f'/api/subtitles/cleanup/{operation["id"]}/apply', headers=headers,
+                           json={'preview_token': operation['preview_token'], 'keepers': keepers})
+    assert response.status_code == 202
+    removed, resume, listing, done = Event(), Event(), Event(), Event()
+    reserved, observed, errors = [], [], []
+    pending = jobs_queue.jobs_pending_queue
+    list_jobs = jobs_queue.list_jobs_from_queue
+
+    class PausedTransfer(deque):
+        def remove(self, job):
+            super().remove(job)
+            removed.set()
+            assert resume.wait(5)
+
+    def reserve():
+        try:
+            reserved.append(jobs_queue._reserve_next_runnable_job())
+        except Exception as error:
+            errors.append(error)
+
+    def read():
+        try:
+            observed.append(service.get_operation(operation['id'])['status'])
+        except Exception as error:
+            errors.append(error)
+        finally:
+            done.set()
+
+    def signal_listing(*args, **kwargs):
+        listing.set()
+        return list_jobs(*args, **kwargs)
+
+    monkeypatch.setattr(jobs_queue, 'jobs_pending_queue', PausedTransfer(pending))
+    monkeypatch.setattr(jobs_queue, 'list_jobs_from_queue', signal_listing)
+    scheduler, poll = Thread(target=reserve), Thread(target=read)
+    scheduler.start()
+    try:
+        assert removed.wait(5)
+        poll.start()
+        assert listing.wait(5)
+        read_during_transfer = done.wait(0.2)
+    finally:
+        resume.set()
+        scheduler.join(5)
+        if poll.ident is not None:
+            poll.join(5)
+    assert not errors
+    assert not scheduler.is_alive() and not poll.is_alive()
+    assert reserved and reserved[0] is not None
+    jobs_queue._run_job(job_instance=reserved[0], reserved=True)
+    assert not read_during_transfer
+    assert observed == ['applying']
+    assert store.get_operation(operation['id'])['status'] == 'complete'
 
 
 @pytest.mark.parametrize('replaced_directory', [False, True])
