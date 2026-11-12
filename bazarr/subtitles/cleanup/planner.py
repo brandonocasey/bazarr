@@ -78,6 +78,8 @@ def _analysis_payload(analysis: MediaAnalysis, download_scores: dict[str, float]
 
 def analyze_operation(operation: Operation, workspace: Path, cancelled: Callable[[], bool]) -> Operation:
     metadata = store.media_metadata(operation['media_type'], operation['media_id'])
+    if metadata['video_path'] != operation['video_path']:
+        raise store.CleanupError('Indexed video changed before analysis; create a fresh preview', 409)
     subtitles = store.indexed_subtitles(operation['media_type'], operation['media_id'])
     paths = input_paths(metadata['video_path'], subtitles)
     identities = [fingerprint(path) for path in paths]
@@ -92,7 +94,7 @@ def analyze_operation(operation: Operation, workspace: Path, cancelled: Callable
     download_scores = store.download_scores(operation['media_type'], operation['media_id'], metadata['indexed_path'])
     payload = _analysis_payload(analysis, download_scores)
     operation.update(analysis=payload, groups=group_tracks(analysis), files=[FileRecord(**asdict(item)) for item in identities],
-                     indexed_subtitles=subtitles, video_path=metadata['video_path'],
+                     indexed_subtitles=subtitles,
                      required_space_bytes=6 * sum(item.size for item in identities) + int(analysis.duration * 32000), status='ready', error=None)
     signed = {key: operation[key] for key in ('analysis', 'groups', 'files', 'indexed_subtitles', 'media_type', 'media_id')}
     operation['preview_token'] = hashlib.sha256(json.dumps(signed, sort_keys=True, allow_nan=False).encode()).hexdigest()

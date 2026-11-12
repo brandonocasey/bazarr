@@ -8,7 +8,7 @@ from threading import Event, Thread, current_thread
 
 import pytest
 
-from app.database import (database, select, delete, TableMovies, TableMoviesSubtitles, TableHistoryMovie,
+from app.database import (database, select, delete, update, TableMovies, TableMoviesSubtitles, TableHistoryMovie,
                           TableSubtitleCleanupOperations, TableShows, TableEpisodes, TableEpisodesSubtitles)
 from app.jobs_queue import jobs_queue
 from subtitles.cleanup import service, store
@@ -213,6 +213,33 @@ def test_removed_pending_job_does_not_leave_operation_polling_forever(library):
     response = client.get(f'/api/subtitles/cleanup/{operation["id"]}', headers=headers)
     assert response.json['status'] == 'failed'
     assert 'canceled or interrupted' in response.json['error']
+
+
+def test_queued_preview_cannot_change_its_locked_media_identity(library):
+    client, headers, media_id, video, aligned, lower = library
+    response = client.post('/api/subtitles/cleanup/preview', headers=headers,
+                           json={'media_type': 'movie', 'media_id': media_id})
+    assert response.status_code == 202
+    before = {path: _sha(path) for path in (video, aligned, lower)}
+    renamed = video.with_name('Renamed verification.mkv')
+    shutil.copyfile(video, renamed)
+    database.execute(update(TableMovies).where(TableMovies.radarrId == media_id).values(path=str(renamed)))
+    for source in (aligned, lower):
+        target = source.with_name(source.name.replace('Cleanup verification', 'Renamed verification'))
+        shutil.copyfile(source, target)
+        database.execute(update(TableMoviesSubtitles).where(TableMoviesSubtitles.path == str(source))
+                         .values(path=str(target)))
+        before[target] = _sha(target)
+    before[renamed] = _sha(renamed)
+    database.commit()
+    failed = _run(response.json)
+    assert failed['status'] == 'failed'
+    assert 'changed before analysis' in failed['error']
+    recovery_key = database.scalar(select(TableSubtitleCleanupOperations.video_path)
+                                   .where(TableSubtitleCleanupOperations.id == failed['id']))
+    assert recovery_key == failed['video_path'] == str(video)
+    assert failed['analysis'] is None and not Path(failed['backup_path']).exists()
+    assert {path: _sha(path) for path in before} == before
 
 
 @pytest.mark.parametrize('transition', ['apply', 'restore'])
