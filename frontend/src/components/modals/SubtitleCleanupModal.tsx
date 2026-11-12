@@ -443,7 +443,7 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
   };
 
   return (
-    <Stack>
+    <Stack style={{ minWidth: 0, overflowWrap: "anywhere" }}>
       <Alert title="Review subtitle cleanup" color="yellow">
         All external and embedded tracks, including previously unscored tracks,
         receive a new speech-timing Pearson correlation score from -1 to 1
@@ -674,6 +674,13 @@ export const SubtitleCleanupView = ({ media }: { media: CleanupMedia[] }) => {
                       />
                       <Button
                         variant="light"
+                        styles={{
+                          root: {
+                            height: "auto",
+                            minHeight: "var(--button-height)",
+                          },
+                          label: { whiteSpace: "normal" },
+                        }}
                         disabled={
                           busy ||
                           query.isError ||
