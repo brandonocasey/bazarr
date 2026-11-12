@@ -29,6 +29,13 @@ class FileIdentity:
     gid: int
 
 
+@dataclass(frozen=True)
+class _CopyContext:
+    content: FileIdentity
+    metadata: FileIdentity
+    created: Callable[[os.stat_result], None] | None = None
+
+
 def fingerprint(path: str) -> FileIdentity:
     source = Path(path)
     if not source.is_absolute() or source.is_symlink():
@@ -104,8 +111,7 @@ def _validate_journal_header(journal: Journal, path: Path) -> None:
         raise ValueError(f'Invalid cleanup journal: {path}')
 
 
-def _verified_copy(source: str, target: Path, expected: FileIdentity,
-                   created: Callable[[os.stat_result], None] | None = None) -> None:
+def _verified_copy(source: str, target: Path, context: _CopyContext) -> None:
     if target.exists() or target.is_symlink():
         raise ValueError(f'Cleanup output already exists: {target}')
     _ensure_directory(target.parent)
@@ -113,18 +119,21 @@ def _verified_copy(source: str, target: Path, expected: FileIdentity,
     try:
         with open(source, 'rb') as reader, target.open('xb') as writer:
             created_inode = os.fstat(writer.fileno()).st_ino
-            if created is not None:
+            if context.created is not None:
                 # Persist ownership before copying bytes so recovery can discard interrupted output.
                 os.fsync(writer.fileno())
                 _sync_directory(target.parent)
-                created(os.fstat(writer.fileno()))
+                context.created(os.fstat(writer.fileno()))
             shutil.copyfileobj(reader, writer)
             writer.flush()
             os.fsync(writer.fileno())
-        shutil.copystat(source, target, follow_symlinks=False)
-        _copy_identity_metadata(target, expected)
+        try:
+            shutil.copystat(source, target, follow_symlinks=False)
+        except PermissionError as error:
+            raise _metadata_permission_error(context.metadata, error) from error
+        _copy_identity_metadata(target, context.metadata)
         actual = fingerprint(str(target))
-        if (actual.size, actual.sha256) != (expected.size, expected.sha256):
+        if (actual.size, actual.sha256) != (context.content.size, context.content.sha256):
             raise ValueError(f'Cleanup copy verification failed: {source}')
     except BaseException:
         try:
@@ -138,11 +147,23 @@ def _verified_copy(source: str, target: Path, expected: FileIdentity,
 
 def _copy_identity_metadata(target: Path, expected: FileIdentity) -> None:
     current = target.stat()
-    if os.name != 'nt' and (current.st_uid, current.st_gid) != (expected.uid, expected.gid):
-        os.chown(target, expected.uid, expected.gid)
-    os.chmod(target, expected.mode)
+    try:
+        if os.name != 'nt' and (current.st_uid, current.st_gid) != (expected.uid, expected.gid):
+            os.chown(target, expected.uid, expected.gid)
+        os.chmod(target, expected.mode)
+    except PermissionError as error:
+        raise _metadata_permission_error(expected, error) from error
     with target.open('rb') as stream:
         os.fsync(stream.fileno())
+
+
+def _metadata_permission_error(expected: FileIdentity, error: PermissionError) -> PermissionError:
+    return PermissionError(
+        f'Cannot preserve metadata for original file {expected.path}: '
+        f'required uid {expected.uid}, gid {expected.gid}, mode {expected.mode:#o}. '
+        f'Grant the Bazarr service account permission to preserve this owner, group and mode, '
+        f'or have an operator with that permission run the operation. Filesystem refusal: {error}'
+    )
 
 
 def _same_content(path: str, expected: FileRecord | None) -> bool:
@@ -180,7 +201,7 @@ def _prepare_entries(directory: Path, changes: list[PreparedFile], identities: l
         relative = Path(*Path(original.path).parts[1:])
         entries.append({
             'path': original.path, 'original': FileRecord(**asdict(original)),
-            'backup': str(directory / 'originals' / relative),
+            'backup': str(directory / 'originals' / relative), 'backup_owner': None,
             'temporary': str(Path(original.path).with_name(f'.bazarr-cleanup-{directory.name}-{index}.stage')),
             'replacement': FileRecord(**asdict(replacement)) if replacement else None,
             'source': change.staged_path, 'applied': False, 'after': None,
@@ -225,7 +246,11 @@ def _stage_entries(directory: Path, journal: Journal) -> None:
     for entry in journal['entries']:
         original = FileIdentity(**entry['original'])
         verify_identity(original)
-        _verified_copy(entry['path'], Path(entry['backup']), original)
+        def remember_backup_owner(info: os.stat_result) -> None:
+            entry['backup_owner'] = {'device': info.st_dev, 'inode': info.st_ino}
+            _write_journal(directory, journal)
+
+        _verified_copy(entry['path'], Path(entry['backup']), _CopyContext(original, original, remember_backup_owner))
         if entry['replacement']:
             _copy_staged(entry, journal, directory)
         _write_journal(directory, journal)
@@ -246,8 +271,8 @@ def _copy_staged(entry: JournalEntry, journal: Journal, directory: Path) -> None
         entry['temporary_owner'] = {'device': info.st_dev, 'inode': info.st_ino}
         _write_journal(directory, journal)
 
-    _verified_copy(source, Path(entry['temporary']), FileIdentity(**expected), remember_owner)
-    _copy_identity_metadata(Path(entry['temporary']), FileIdentity(**entry['original']))
+    context = _CopyContext(FileIdentity(**expected), FileIdentity(**entry['original']), remember_owner)
+    _verified_copy(source, Path(entry['temporary']), context)
     entry['temporary_ready'] = True
     _write_journal(directory, journal)
 
@@ -305,17 +330,64 @@ def restore_transaction(directory: Path) -> Journal:
     return recover_transaction(directory)
 
 
+def _originals_match(journal: Journal) -> bool:
+    for entry in journal['entries']:
+        original = entry['original']
+        actual = fingerprint(entry['path'])
+        if (actual.size, actual.sha256, actual.mode, actual.uid, actual.gid, actual.modified_ns) != (
+            original['size'], original['sha256'], original['mode'], original['uid'], original['gid'], original['modified_ns']
+        ):
+            return False
+    return True
+
+
+def _discard_backup(entry: JournalEntry) -> None:
+    owner = entry.get('backup_owner')
+    if owner is None:
+        return
+    backup = Path(entry['backup'])
+    try:
+        actual = fingerprint(str(backup))
+        if (actual.device, actual.inode, actual.size, actual.sha256) != (
+            owner['device'], owner['inode'], entry['original']['size'], entry['original']['sha256']
+        ):
+            return
+        backup.unlink()
+        _sync_directory(backup.parent)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        logging.exception('Cannot discard rolled-back cleanup backup %s', backup)
+
+
+def discard_rollback_backups(directory: Path) -> None:
+    """Remove captured backup copies only after durable rollback and verification of all originals."""
+    try:
+        journal = read_journal(directory)
+        if journal is None or journal['phase'] != 'rolled_back':
+            return
+        if not _originals_match(journal):
+            return
+        for entry in journal['entries']:
+            _discard_backup(entry)
+    except (OSError, ValueError):
+        logging.exception('Cannot verify originals for rolled-back cleanup %s', directory)
+
+
 def recover_transaction(directory: Path) -> Journal:
     journal = read_journal(directory)
     if journal is None:
         raise ValueError(f'Cleanup journal is missing: {directory}')
     phase = journal['phase']
     if phase in ('complete', 'restored', 'rolled_back'):
+        if phase == 'rolled_back':
+            discard_rollback_backups(directory)
         return journal
     if phase == 'preparing':
         _remove_temporaries(journal)
         journal['phase'] = 'rolled_back'
         _write_journal(directory, journal)
+        discard_rollback_backups(directory)
         return journal
     if phase not in ('committing', 'rolling_back', 'restoring'):
         raise ValueError(f'Unknown cleanup recovery phase: {phase}')
@@ -329,4 +401,6 @@ def recover_transaction(directory: Path) -> Journal:
         _write_journal(directory, journal)
     journal['phase'] = 'restored' if phase == 'restoring' else 'rolled_back'
     _write_journal(directory, journal)
+    if journal['phase'] == 'rolled_back':
+        discard_rollback_backups(directory)
     return journal
