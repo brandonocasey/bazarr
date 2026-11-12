@@ -274,7 +274,7 @@ def generate_subtitles(path, languages, audio_language, sceneName, title, media_
                             subtitle_formats.add(s.format)
 
                         try:
-                            with media_write_lock(video.original_path):
+                            with media_write_lock(video.original_path, job_id=job_id):
                                 fld = get_target_folder(path)
                                 chmod = int(settings.general.chmod, 8) if not sys.platform.startswith(
                                     'win') and settings.general.chmod_enabled else None

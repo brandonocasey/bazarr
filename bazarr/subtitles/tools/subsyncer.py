@@ -200,7 +200,7 @@ class SubSyncer:
              max_offset_seconds, no_fix_framerate, gss, reference=None, sonarr_series_id=None, sonarr_episode_id=None,
              radarr_id=None, job_id=None, force_sync=False, quality_min_score=None, quality_max_offset_seconds=None,
              quality_max_framerate_deviation=None):
-        with media_write_lock(subtitle_media_path(srt_path, video_path, allow_unindexed=True)):
+        with media_write_lock(subtitle_media_path(srt_path, video_path, allow_unindexed=True), job_id=job_id):
             self.reference = video_path
             self.srtin = srt_path
             self.sync_result = None

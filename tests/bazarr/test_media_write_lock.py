@@ -373,6 +373,104 @@ def test_fresh_sidecar_absolute_custom_folder(media, tmp_path, monkeypatch):
     assert not destination.exists()
 
 
+@pytest.mark.parametrize('extension', ['.vtt', '.srt'])
+def test_fresh_translation_accepts_writer_formats_on_casefolding_paths(media, guard, monkeypatch, extension):
+    from app.config import settings
+    from subtitles.tools.translate.main import translate_subtitles_file
+
+    video, _, _ = media
+    source = video.with_suffix('.en' + extension)
+    source.write_text('WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n')
+    monkeypatch.setattr(settings.general, 'subfolder', 'current')
+    monkeypatch.setattr(coordination.os.path, 'normcase', lambda value: value.lower())
+    guard(lambda path: (_ for _ in ()).throw(RecoveryRequired(path)))
+    with pytest.raises(RecoveryRequired):
+        translate_subtitles_file(str(video), str(source), 'en', 'fr', False, False,
+                                 'movie', None, None, 7, None, job_id=1)
+
+
+def test_fresh_unindexed_mixed_case_basename_is_normalized(media, monkeypatch):
+    from app.config import settings
+
+    video, _, _ = media
+    source = video.with_suffix('.de.srt')
+    monkeypatch.setattr(settings.general, 'subfolder', 'current')
+    monkeypatch.setattr(coordination.os.path, 'normcase', lambda value: value.lower())
+    assert coordination.subtitle_media_path(str(source), str(video), allow_unindexed=True) == str(video).lower()
+
+
+def test_cancellation_exits_cross_process_file_lock_wait(guard, tmp_path, monkeypatch):
+    from app.get_args import args
+    from app.jobs_queue import jobs_queue, JobCanceled
+
+    video = str(tmp_path / 'Movie.mkv')
+    ready = tmp_path / 'lock-ready'
+    canceled = threading.Event()
+    monkeypatch.setattr(jobs_queue, 'get_job', lambda job_id: SimpleNamespace(cancel_event=canceled))
+    script = '''
+import os,sys
+os.environ['NO_CLI']='true'
+import bazarr.app.libs
+from app.get_args import args
+from utilities.media_write_lock import media_write_lock
+from pathlib import Path
+args.config_dir=sys.argv[1]
+with media_write_lock(sys.argv[2]):
+    Path(sys.argv[3]).write_text('locked')
+    sys.stdin.read(1)
+'''
+    environment = dict(os.environ)
+    environment['PYTHONPATH'] = os.pathsep.join((str(Path.cwd()), str(Path.cwd() / 'bazarr')))
+    process = subprocess.Popen([sys.executable, '-c', script, args.config_dir, video, str(ready)],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=environment, text=True)
+    try:
+        for _ in range(500):
+            if ready.exists():
+                break
+            threading.Event().wait(0.01)
+        assert ready.exists(), 'child did not acquire file lock'
+
+        def wait_for_writer():
+            with coordination.media_write_lock(video, job_id=1):
+                pytest.fail('canceled writer acquired the busy file lock')
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(wait_for_writer)
+            canceled.set()
+            with pytest.raises(JobCanceled):
+                future.result(timeout=2)
+        assert process.poll() is None
+    finally:
+        process.communicate('x', timeout=5)
+
+
+def test_canceled_sync_leaves_writer_wait_without_releasing_other_writer(media, guard, monkeypatch):
+    from app.jobs_queue import JobCanceled
+    from subtitles.tools import subsyncer
+
+    video, subtitle, _ = media
+    canceled = threading.Event()
+    started = threading.Event()
+    monkeypatch.setattr(subsyncer.jobs_queue, 'get_job', lambda job_id: SimpleNamespace(cancel_event=canceled))
+
+    def sync():
+        started.set()
+        return subsyncer.SubSyncer().sync(str(video), str(subtitle), 'en', False, False,
+                                         60, False, False, job_id=1)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with coordination.media_write_lock(str(video)):
+            future = pool.submit(sync)
+            assert started.wait(5)
+            canceled.set()
+            try:
+                with pytest.raises(JobCanceled):
+                    future.result(timeout=2)
+            finally:
+                canceled.set()
+
+
 def test_waiting_writer_recovers_after_guard_failure(guard, tmp_path):
     from concurrent.futures import TimeoutError
 

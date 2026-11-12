@@ -145,7 +145,7 @@ def manual_upload_subtitle(path, language, forced, hi, media_type, subtitle, fil
     try:
         # ensure that formats must be a tuple of strings
         sub_format = (sub.format,) if isinstance(sub.format, str) else sub.format
-        with media_write_lock(path):
+        with media_write_lock(path, job_id=job_id):
             saved_subtitles = save_subtitles(path,
                                              [sub],
                                              single=single,
@@ -186,7 +186,7 @@ def manual_upload_subtitle(path, language, forced, hi, media_type, subtitle, fil
                           uploaded_language_code3, audio_language['name'], audio_language['code2'],
                           audio_language['code3'], 100, "1", "manual", "user", "unknown", sonarrSeriesId,
                           sonarrEpisodeId or radarrId,)
-        with media_write_lock(path):
+        with media_write_lock(path, job_id=job_id):
             postprocessing(args, path)
             set_chmod(subtitles_path=subtitle_path)
 

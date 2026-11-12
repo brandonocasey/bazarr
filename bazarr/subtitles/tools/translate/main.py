@@ -50,7 +50,7 @@ def translate_subtitles_file(video_path, source_srt_file, from_lang, to_lang, fo
                                          is_progress=True)
         return
 
-    with media_write_lock(subtitle_media_path(source_srt_file, video_path, allow_unindexed=True)):
+    with media_write_lock(subtitle_media_path(source_srt_file, video_path, allow_unindexed=True), job_id=job_id):
         try:
             logging.debug(f'Translation request: video={video_path}, source={source_srt_file}, from={from_lang}, to={to_lang}')
 

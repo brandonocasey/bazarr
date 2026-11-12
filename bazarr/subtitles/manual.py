@@ -220,7 +220,7 @@ def manual_download_subtitle(path, audio_language, hi, forced, subtitle, provide
             try:
                 chmod = int(settings.general.chmod, 8) if not sys.platform.startswith(
                     'win') and settings.general.chmod_enabled else None
-                with media_write_lock(video.original_path):
+                with media_write_lock(video.original_path, job_id=job_id):
                     saved_subtitles = save_subtitles(video.original_path, [subtitle],
                                                      single=settings.general.single_language,
                                                      tags=None,  # fixme

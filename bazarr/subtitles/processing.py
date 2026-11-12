@@ -126,7 +126,7 @@ def process_subtitle(subtitle, media_type, audio_language, path, max_score, is_u
 
         if not use_pp_threshold or (use_pp_threshold and percent_score < pp_threshold):
             logging.debug(f"BAZARR Using post-processing command: {args}")
-            with media_write_lock(path):
+            with media_write_lock(path, job_id=job_id):
                 postprocessing(args, path)
                 set_chmod(subtitles_path=downloaded_path)
         else:

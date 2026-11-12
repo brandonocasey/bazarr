@@ -155,7 +155,7 @@ def extract_embedded_subtitle(subtitles_id, media_type, job_id=None, filename_su
         video_path = path_mappings.path_replace_movie(data.path)
         media_id = data.radarrId
 
-    with media_write_lock(video_path):
+    with media_write_lock(video_path, job_id=job_id):
         if not os.path.isfile(video_path):
             jobs_queue.update_job_name(job_id=job_id, new_job_name=f"Failed to extract embedded subtitles for video file "
                                                                    f"{video_path}")
